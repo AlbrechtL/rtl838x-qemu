@@ -1,0 +1,186 @@
+# RTL838x under QEMU
+
+Runs OpenWrt for Realtek RTL838x switch SoCs in an emulator. The target is the
+Zyxel GS1900-8 image in `images/`, booted unmodified.
+
+Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
+comes up, and `lan1`..`lan8` appear as network devices with a 1 Gbps link.
+Packets do not move yet — the switch data path is the next phase.
+
+```
+$ ./rtl838x.sh test
+reaches the console prompt               PASS
+SoC is identified as RTL8380M            PASS
+lan1..lan8 exist                         PASS
+all eight ports are up                   PASS
+ports negotiated 1 Gbps                  PASS
+guest clock advances                     PASS
+otto timer is the clocksource            PASS
+no kernel oops or unhandled faults       PASS
+```
+
+## Quick start
+
+Everything runs in containers; nothing but Docker, git and a POSIX shell is
+needed on the host.
+
+```sh
+git submodule update --init      # QEMU, pinned at v11.1.1
+./rtl838x.sh build               # ~10 min the first time, seconds after that
+./rtl838x.sh run                 # boot the image; leave with Ctrl-A x
+./rtl838x.sh test                # automated boot test
+```
+
+Other commands: `run-log` (adds `-d unimp,guest_errors` into `out/qemu.log`),
+`shell` (a shell in the build container), `info` and `dts` (inspect the
+firmware image), `clean`, `distclean`, `help`.
+
+`run`, `run-log`, `test`, `info` and `dts` take the image as their first
+argument, defaulting to the one in `images/`. QEMU options all start with a
+dash, so a bare word is unambiguously an image and anything else is passed
+through to QEMU:
+
+```sh
+./rtl838x.sh run                             # the default image
+./rtl838x.sh run ~/builds/other.bin          # somewhere else entirely
+./rtl838x.sh run ~/builds/other.bin -s -S    # and wait for gdb
+./rtl838x.sh run -d in_asm                   # default image, QEMU options
+```
+
+Images outside this directory are bind-mounted into the container
+automatically, so they can live anywhere. `IMAGE`, `BUILDER`, `RUNTIME`,
+`DOCKER` and `DEBUG` can also be set in the environment.
+
+## How the image boots
+
+`images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
+it down:
+
+| Offset | Content |
+|---|---|
+| `0x0000` | U-Boot image header with the magic replaced by `0x83800000`, the value the stock bootloader looks for (the device tree names it as `openwrt,ih-magic`) |
+| `0x0040` | `rt-loader`, position independent code that relocates itself, prints the SoC type, and decompresses the kernel |
+| `0x515c` | LZMA stream holding a 17 MB kernel with its device tree appended |
+
+The machine parses that header, copies the payload to `0x80100000` and starts
+executing, so `rt-loader` runs exactly as it does on the real switch. ELF
+`vmlinux` files and raw kernels are also accepted.
+
+Because the device tree is appended to the kernel, QEMU never supplies one:
+the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
+prints it — that file is the specification this machine implements.
+
+## What is modelled
+
+All of it lives in `src/hw/mips/`, copied into the pinned QEMU tree at build
+time by `scripts/sync.sh`.
+
+| Device | Address | Notes |
+|---|---|---|
+| Interrupt controller | `0x18003000` | 32 sources onto 5 outputs, wired to MIPS IP2..IP6 |
+| Otto timer | `0x18003100` | Five count-up timers; clocksource *and* clockevent |
+| Memory controller | `0x18001000` | Reports 128 MiB to both rt-loader and the kernel |
+| SPI-NOR controller | `0x18001200` | Stub, reports "ready" (see below) |
+| UART | `0x18002000` | 16550, reg-shift 2 |
+| Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
+| GPIO | `0x18003500` | 24 lines |
+| Switch core | `0x1b000000` | SoC ID, PLLs, thermal, table engine, MDIO, 8 PHYs |
+
+Three details cost real debugging time and are worth knowing before changing
+anything:
+
+* **The UART is passed `DEVICE_LITTLE_ENDIAN`**, which looks wrong on a
+  big-endian machine. The registers are one byte wide at a four byte stride,
+  so a 32-bit read returns the register in the *top* lane — `rt-loader` polls
+  the line status register for `0x20000000`, not `0x20`. That placement is how
+  QEMU spells it. Get this wrong and the machine boots in complete silence.
+* **The CPU model is `rtl8380`**, added by `scripts/add-cpu.py`: QEMU's `4KEc`
+  with MIPS16e. The ASE is missing from QEMU's model but present in the
+  silicon, and OpenWrt compiles userspace for this target with MIPS16
+  instructions. Without it the kernel boots fine and then dies the instant it
+  executes `/init`.
+* **Several registers must clear themselves.** Three are busy-waited on with
+  no timeout at all, so getting one wrong hangs the boot with no output:
+  `0x6168` bit 0 (ACL clear, during DSA probe), `0x3370` bit 26 (L2 flush),
+  and the SPI ready bit at `0x18001208` bit 27. The PHY's BMCR
+  restart-autonegotiation bit is the same kind of trap in miniature: leave it
+  set and every port stays down while everything else looks healthy.
+
+A full boot produces no `-d unimp,guest_errors` output at all, so nothing the
+guest touches is unmapped. That is not the same as complete: the switch window
+accepts and stores writes it does not yet act on.
+
+## Known gaps
+
+* **No data path.** Nothing is wired to a QEMU netdev, so no frames move. This
+  is the main piece of work remaining.
+* `failed to add … to fdb: -524` during boot. The bridge's own address cannot
+  be pushed into the hardware FDB, which is not modelled. Harmless today.
+* The RTL8231 GPIO expander on the bit-banged MDIO bus is absent, so the reset
+  button and the system LED do not exist.
+* The SPI-NOR controller answers but has no flash behind it, so there is no
+  persistent configuration and `sysupgrade` cannot work. Fine for initramfs
+  images.
+* The link-change interrupt is wired but never raised; ports are permanently
+  up.
+
+## Next: the switch data path
+
+Enough to forward traffic between ports, so VLAN and RSTP behaviour can be
+tested. Roughly:
+
+1. The CPU-port MAC (`realtek,rtl8380-eth`): two-level descriptor rings at
+   `0x9f00`/`0x9f40`, where the ring entry is a pointer word plus ownership
+   bits and the descriptor proper is 32 bytes carrying a 20-byte CPU tag. The
+   tag is *not* in the frame; source port, queue and trap reason live there.
+2. Eight `NICState`s with netdev backends, following `hw/net/rocker/`'s
+   `DEFINE_PROP_ARRAY("ports", …, qdev_prop_netdev, NICPeers)`.
+3. Forwarding that reads back the state the driver already programs: the port
+   isolation matrix (`0x4100 + port*4`), per-port per-MSTI STP state (MSTI
+   table), VLAN membership and untagged masks, PVID (`0x3c00 + port*4`) and
+   the flood masks.
+4. For RSTP specifically, BPDUs must reach the CPU port regardless of STP
+   state, per `0x4330`/`0x4348`, carrying the right trap reason. That single
+   field is the difference between RSTP converging and failing silently.
+
+The FDB is best faked: the hardware layout is a 8192x4 hash plus a CAM with no
+valid bit and a bespoke hash. Keep a normal software table for forwarding and
+mirror it into the register window only when the driver dumps it.
+
+## Layout
+
+```
+rtl838x.sh          build, run and test; everything goes through this
+src/hw/mips/        device models and the board
+src/include/hw/mips/rtl838x.h
+scripts/sync.sh     copies the models into qemu/ and adds the build glue
+scripts/add-cpu.py  adds the rtl8380 CPU model, derived from the tree's 4KEc
+scripts/build.sh    configure + ninja, runs inside the build container
+scripts/imgtool.py  inspect/unpack the firmware image
+docker/             build container and slim runtime container
+tests/test_boot.py  boots the image and checks it over the serial console
+qemu/               submodule, pinned to v11.1.1
+```
+
+`scripts/sync.sh` is idempotent and re-runs on every build, so rebasing onto a
+newer QEMU is `git -C qemu checkout <tag>` followed by `./rtl838x.sh build`. The
+only edits it makes to upstream files are one Kconfig stanza, one meson line
+and one CPU definition.
+
+## Debugging
+
+```sh
+./rtl838x.sh run-log            # unimplemented registers and guest errors
+./rtl838x.sh run -d in_asm      # instruction trace, for hangs before the console
+./rtl838x.sh run -s -S          # wait for gdb on :1234
+```
+
+Set `RTL838X_MDIO_DEBUG` to 1 in `src/hw/mips/rtl838x_switch.c` to trace every
+MDIO transaction; that is how the PHY behaviour was brought up.
+
+## License
+
+GPL-2.0-or-later, matching QEMU's `hw/mips/` (this project's device models are
+written to be copied into that tree and are meant to be upstreamable, so they
+are bound to that license regardless; everything else follows for
+consistency). See `LICENSE`.

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Slim image holding just the built emulator.  Built by "./rtl838x.sh build";
+# it copies the install tree from out/qemu.
+FROM debian:13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libpixman-1-0 \
+        libslirp0 \
+        libcapstone5 \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY out/qemu /opt/qemu
+COPY scripts/imgtool.py /opt/bin/imgtool.py
+
+ENV PATH=/opt/qemu/bin:/opt/bin:$PATH
+WORKDIR /work
