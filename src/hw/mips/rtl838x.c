@@ -256,7 +256,7 @@ static void rtl838x_machine_init(MachineClass *mc)
 {
     mc->desc = "Realtek RTL8380M switch SoC";
     mc->init = rtl838x_init;
-    /* 4KEc plus MIPS16e; see scripts/add-cpu.py for why that matters. */
+    /* 4KEc plus MIPS16e; see patches/rtl838x.patch for why that matters. */
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("rtl8380");
     mc->default_ram_id = "rtl838x.ram";
     mc->default_ram_size = 128 * MiB;
