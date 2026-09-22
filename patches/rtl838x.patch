@@ -21,7 +21,7 @@ index 390f0fd..456188f 100644
  mips_ss.add(when: 'CONFIG_JAZZ', if_true: files('jazz.c'))
  mips_ss.add(when: 'CONFIG_FULOONG', if_true: files('fuloong2e.c'))
  mips_ss.add(when: 'CONFIG_MIPS_BOSTON', if_true: files('boston.c'))
-+mips_ss.add(when: 'CONFIG_RTL838X', if_true: files('rtl838x.c', 'rtl838x_intc.c', 'rtl838x_timer.c', 'rtl838x_socmisc.c', 'rtl838x_gpio.c', 'rtl838x_wdt.c', 'rtl838x_switch.c'))
++mips_ss.add(when: 'CONFIG_RTL838X', if_true: files('rtl838x.c', 'rtl838x_intc.c', 'rtl838x_timer.c', 'rtl838x_socmisc.c', 'rtl838x_gpio.c', 'rtl838x_wdt.c', 'rtl838x_switch.c', 'rtl838x_eth.c', 'rtl838x_fwd.c', 'rtl838x_port.c'))
  endif
  
  hw_arch += {'mips': mips_ss}

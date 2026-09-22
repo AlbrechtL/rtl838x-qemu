@@ -17,10 +17,12 @@
  *
  * so every one of those has to complete instantly here.
  *
- * What is modelled: identification, clocks, thermal, the self-clearing and
- * write-one-to-clear bits, the table access engine with real backing store,
- * the MDIO command engine and eight internal PHYs reporting 1000/full.  What
- * is not (yet): the packet data path, which is what phase 2 adds.
+ * What is modelled here: identification, clocks, thermal, the self-clearing
+ * and write-one-to-clear bits, the table access engine with real backing
+ * store, the MDIO command engine, eight internal PHYs and the link state they
+ * report.  The data path that runs over the same window lives next door:
+ * rtl838x_eth.c owns the CPU-port DMA engine and rtl838x_fwd.c owns what the
+ * silicon does between the ports.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -31,8 +33,6 @@
 #include "hw/mips/rtl838x.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
-
-#define SW_REGS         (RTL838X_SW_SIZE / 4)
 
 /*
  * Set to 1 to trace every MDIO transaction.  Bringing a new PHY behaviour up
@@ -90,21 +90,26 @@
 /* Self-clearing command bits. */
 #define SW_RST_GLB_CTRL_0       0x003c
 #define SW_RST_GLB_SELF_CLEAR   0x0000001c  /* NIC, queue and serdes resets */
+#define SW_RST_GLB_NIC          0x0000000c  /* of those, the two the NIC uses */
 #define SW_ACL_CLR_CTRL         0x6168
 #define SW_ACL_CLR_EXEC         (1u << 0)
 #define SW_L2_TBL_FLUSH_CTRL    0x3370
 #define SW_L2_TBL_FLUSH_EXEC    (1u << 26)
+#define SW_L2_TBL_FLUSH_BY_PORT (1u << 23)
 
 /* Write-one-to-clear status registers. */
 #define SW_ISR_GLB_SRC          0x1148
 #define SW_ISR_PORT_LINK_CHG    0x114c
-#define SW_DMA_IF_INTR_STS      0x9f54
 
-/* Port state. */
+/*
+ * Port and link state.  MAC_LINK_STS is not stored: it is derived from the
+ * netdev backends on every read, so "no backend" reads as an unplugged port.
+ * The driver's interrupt handler W1Cs ISR_PORT_LINK_CHG, then reads
+ * MAC_LINK_STS twice because the real register is latched.
+ */
 #define SW_MAC_LINK_STS         0xa188
-#define SW_CPU_PORT             28
-#define SW_PHY_PORT_FIRST       8
-#define SW_PHY_PORT_LAST        15
+#define SW_IMR_GLB              0x1100
+#define SW_IMR_PORT_LINK_CHG    0x1104
 
 /* MDIO command engine. */
 #define SW_SMI_GLB_CTRL         0xa100
@@ -121,9 +126,6 @@
 #define SW_SMI_CMD_WRITE_C22    (2u << 1)
 #define SW_SMI_CMD_WRITE_C45    (3u << 1)
 
-#define SW_NUM_PHYS             8
-#define SW_PHY_REGS             32
-
 /* Standard clause 22 registers. */
 #define MII_BMCR                0
 #define MII_BMSR                1
@@ -133,6 +135,9 @@
 
 #define BMCR_RESET              (1u << 15)
 #define BMCR_ANRESTART          (1u << 9)
+
+#define BMSR_LSTATUS            (1u << 2)
+#define BMSR_ANEGCOMPLETE       (1u << 5)
 
 /*
  * Table access engine.  Three command/data window pairs, each multiplexing
@@ -180,22 +185,9 @@ static const RTL838xTableWindow sw_table_windows[] = {
     },
 };
 
-#define SW_NUM_TABLE_WINDOWS ARRAY_SIZE(sw_table_windows)
-#define SW_TABLES_PER_WINDOW ARRAY_SIZE(sw_table_windows[0].tables)
-
-struct RTL838xSwitchState {
-    SysBusDevice parent_obj;
-
-    MemoryRegion iomem;
-    qemu_irq irq;
-
-    uint32_t regs[SW_REGS];
-    uint16_t phy[SW_NUM_PHYS][SW_PHY_REGS];
-
-    uint32_t *table[SW_NUM_TABLE_WINDOWS][SW_TABLES_PER_WINDOW];
-};
-
-OBJECT_DECLARE_SIMPLE_TYPE(RTL838xSwitchState, RTL838X_SWITCH)
+QEMU_BUILD_BUG_ON(ARRAY_SIZE(sw_table_windows) != RTL838X_SW_TABLE_WINDOWS);
+QEMU_BUILD_BUG_ON(ARRAY_SIZE(sw_table_windows[0].tables) !=
+                  RTL838X_SW_TABLES_PER_WINDOW);
 
 /* ------------------------------------------------------------------ PHYs */
 
@@ -206,9 +198,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RTL838xSwitchState, RTL838X_SWITCH)
  */
 static void rtl838x_phy_reset_one(RTL838xSwitchState *s, unsigned port)
 {
-    uint16_t *p = s->phy[port - SW_PHY_PORT_FIRST];
+    uint16_t *p = s->phy[port - RTL838X_SW_PORT_FIRST];
 
-    memset(p, 0, SW_PHY_REGS * sizeof(*p));
+    memset(p, 0, RTL838X_SW_PHY_REGS * sizeof(*p));
     p[0]  = 0x1140;     /* BMCR: 1000 Mb/s, full duplex, autoneg enabled */
     p[1]  = 0x796d;     /* BMSR: link up, autoneg complete, extended status */
     p[2]  = 0x001c;     /* PHYID1 */
@@ -222,7 +214,8 @@ static void rtl838x_phy_reset_one(RTL838xSwitchState *s, unsigned port)
 
 static void rtl838x_phy_reset(RTL838xSwitchState *s)
 {
-    for (unsigned port = SW_PHY_PORT_FIRST; port <= SW_PHY_PORT_LAST; port++) {
+    for (unsigned port = RTL838X_SW_PORT_FIRST;
+         port <= RTL838X_SW_PORT_LAST; port++) {
         rtl838x_phy_reset_one(s, port);
     }
 }
@@ -230,13 +223,28 @@ static void rtl838x_phy_reset(RTL838xSwitchState *s)
 static uint16_t rtl838x_phy_read(RTL838xSwitchState *s, unsigned port,
                                  unsigned page, unsigned reg)
 {
-    if (port < SW_PHY_PORT_FIRST || port > SW_PHY_PORT_LAST) {
+    uint16_t val;
+
+    if (port < RTL838X_SW_PORT_FIRST || port > RTL838X_SW_PORT_LAST) {
         return 0xffff;  /* nothing answers: reads as an idle MDIO bus */
     }
     if (page != 0) {
         return 0;       /* vendor pages exist but hold nothing interesting */
     }
-    return s->phy[port - SW_PHY_PORT_FIRST][reg % SW_PHY_REGS];
+
+    val = s->phy[port - RTL838X_SW_PORT_FIRST][reg % RTL838X_SW_PHY_REGS];
+
+    /*
+     * The link is the netdev backend's, not ours: a port with nothing plugged
+     * into it reports no carrier and no completed negotiation, which is how
+     * phylink ends up marking lanN down.  Everything else in the register file
+     * keeps describing a port that would negotiate 1000/full if it were.
+     */
+    if (reg == MII_BMSR && !rtl838x_switch_link_up(s, port)) {
+        val &= ~(BMSR_LSTATUS | BMSR_ANEGCOMPLETE);
+    }
+
+    return val;
 }
 
 /* Registers the link partner and our own status own; writes are ignored. */
@@ -253,7 +261,8 @@ static void rtl838x_phy_write(RTL838xSwitchState *s, uint32_t port_mask,
         return;
     }
 
-    for (unsigned port = SW_PHY_PORT_FIRST; port <= SW_PHY_PORT_LAST; port++) {
+    for (unsigned port = RTL838X_SW_PORT_FIRST;
+         port <= RTL838X_SW_PORT_LAST; port++) {
         if (!(port_mask & (1u << port))) {
             continue;
         }
@@ -270,7 +279,7 @@ static void rtl838x_phy_write(RTL838xSwitchState *s, uint32_t port_mask,
             }
             val &= ~(BMCR_RESET | BMCR_ANRESTART);
         }
-        s->phy[port - SW_PHY_PORT_FIRST][reg % SW_PHY_REGS] = val;
+        s->phy[port - RTL838X_SW_PORT_FIRST][reg % RTL838X_SW_PHY_REGS] = val;
     }
 }
 
@@ -311,6 +320,71 @@ static void rtl838x_mdio_exec(RTL838xSwitchState *s, uint32_t cmd)
     }
 }
 
+/* ----------------------------------------------------------- link state */
+
+/*
+ * The board creates one rtl838x-port device per front-panel port, each holding
+ * a QEMU NIC, and each registers itself here as it is realized.
+ */
+void rtl838x_switch_attach_port(RTL838xSwitchState *s, unsigned port,
+                                RTL838xPortState *p)
+{
+    assert(port >= RTL838X_SW_PORT_FIRST && port <= RTL838X_SW_PORT_LAST);
+    s->port[port - RTL838X_SW_PORT_FIRST] = p;
+}
+
+bool rtl838x_switch_link_up(RTL838xSwitchState *s, unsigned port)
+{
+    RTL838xPortState *p;
+
+    if (port == RTL838X_SW_CPU_PORT) {
+        return true;    /* the CPU port is wired to the SoC, not to a cable */
+    }
+    if (port < RTL838X_SW_PORT_FIRST || port > RTL838X_SW_PORT_LAST) {
+        return false;
+    }
+
+    p = s->port[port - RTL838X_SW_PORT_FIRST];
+    return p && rtl838x_port_link_up(p);
+}
+
+static uint32_t rtl838x_switch_link_mask(RTL838xSwitchState *s)
+{
+    uint32_t mask = 1u << RTL838X_SW_CPU_PORT;
+
+    for (unsigned p = RTL838X_SW_PORT_FIRST; p <= RTL838X_SW_PORT_LAST; p++) {
+        if (rtl838x_switch_link_up(s, p)) {
+            mask |= 1u << p;
+        }
+    }
+    return mask;
+}
+
+/* The core interrupt is level driven and gated by both the per-port and the
+ * global mask, which the DSA driver enables once at probe. */
+static void rtl838x_switch_update_irq(RTL838xSwitchState *s)
+{
+    bool pending = s->regs[SW_ISR_PORT_LINK_CHG / 4] &
+                   s->regs[SW_IMR_PORT_LINK_CHG / 4];
+
+    qemu_set_irq(s->irq, pending && (s->regs[SW_IMR_GLB / 4] & 1));
+}
+
+void rtl838x_switch_link_changed(RTL838xSwitchState *s, unsigned port)
+{
+    if (!rtl838x_switch_link_up(s, port)) {
+        /*
+         * Real silicon drops what it learned behind a port that went away;
+         * without this a stale entry black-holes traffic until the station
+         * speaks again from wherever it moved to.
+         */
+        rtl838x_fwd_flush(s, port);
+    }
+
+    s->regs[SW_ISR_PORT_LINK_CHG / 4] |= 1u << port;
+    rtl838x_switch_update_irq(s);
+}
+
 /* ---------------------------------------------------------- table engine */
 
 static void rtl838x_table_exec(RTL838xSwitchState *s, unsigned w, uint32_t cmd)
@@ -324,7 +398,7 @@ static void rtl838x_table_exec(RTL838xSwitchState *s, unsigned w, uint32_t cmd)
     const RTL838xTableDesc *desc = NULL;
     unsigned t;
 
-    for (t = 0; t < SW_TABLES_PER_WINDOW; t++) {
+    for (t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
         if (win->tables[t].width && win->tables[t].type == type) {
             desc = &win->tables[t];
             break;
@@ -348,10 +422,36 @@ static void rtl838x_table_exec(RTL838xSwitchState *s, unsigned w, uint32_t cmd)
     }
 }
 
+/*
+ * Row `index` of table `type` in window `window`, or NULL if that table does
+ * not exist or the row is out of range.  The forwarding engine reads the VLAN,
+ * untagged-egress and per-port STP tables back out of here.
+ */
+uint32_t *rtl838x_switch_table_row(RTL838xSwitchState *s, unsigned window,
+                                   unsigned type, uint32_t index)
+{
+    const RTL838xTableWindow *win;
+
+    assert(window < RTL838X_SW_TABLE_WINDOWS);
+    win = &sw_table_windows[window];
+
+    for (unsigned t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
+        const RTL838xTableDesc *desc = &win->tables[t];
+
+        if (desc->width && desc->type == type) {
+            if (index >= desc->rows) {
+                return NULL;
+            }
+            return &s->table[window][t][(size_t)index * desc->width];
+        }
+    }
+    return NULL;
+}
+
 /* Returns the index of the table window whose command register this is. */
 static int rtl838x_table_window(hwaddr addr)
 {
-    for (unsigned w = 0; w < SW_NUM_TABLE_WINDOWS; w++) {
+    for (unsigned w = 0; w < RTL838X_SW_TABLE_WINDOWS; w++) {
         if (sw_table_windows[w].cmd_reg == addr) {
             return w;
         }
@@ -364,6 +464,10 @@ static int rtl838x_table_window(hwaddr addr)
 static uint64_t rtl838x_switch_read(void *opaque, hwaddr addr, unsigned size)
 {
     RTL838xSwitchState *s = opaque;
+
+    if (addr == SW_MAC_LINK_STS) {
+        return rtl838x_switch_link_mask(s);
+    }
 
     return s->regs[addr / 4];
 }
@@ -384,6 +488,9 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
     case SW_RST_GLB_CTRL_0:
         /* Resets complete immediately; the driver polls for them to clear. */
         s->regs[addr / 4] = val & ~SW_RST_GLB_SELF_CLEAR;
+        if (val & SW_RST_GLB_NIC) {
+            rtl838x_eth_reset(s);
+        }
         return;
 
     case SW_ACL_CLR_CTRL:
@@ -392,12 +499,29 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
 
     case SW_L2_TBL_FLUSH_CTRL:
         s->regs[addr / 4] = val & ~SW_L2_TBL_FLUSH_EXEC;
+        /*
+         * Bit 23 selects "by port", with the port in bits [9:5]; otherwise the
+         * whole table goes.  The driver walks every port in turn on shutdown.
+         */
+        if (val & SW_L2_TBL_FLUSH_EXEC) {
+            rtl838x_fwd_flush(s, (val & SW_L2_TBL_FLUSH_BY_PORT)
+                                 ? (int)((val >> 5) & 0x1f) : -1);
+        }
         return;
 
     case SW_ISR_GLB_SRC:
-    case SW_ISR_PORT_LINK_CHG:
-    case SW_DMA_IF_INTR_STS:
         s->regs[addr / 4] &= ~(uint32_t)val;
+        return;
+
+    case SW_ISR_PORT_LINK_CHG:
+        s->regs[addr / 4] &= ~(uint32_t)val;
+        rtl838x_switch_update_irq(s);
+        return;
+
+    case SW_IMR_GLB:
+    case SW_IMR_PORT_LINK_CHG:
+        s->regs[addr / 4] = val;
+        rtl838x_switch_update_irq(s);
         return;
 
     case SW_MAC_LINK_STS:
@@ -415,6 +539,10 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
 
     default:
         break;
+    }
+
+    if (rtl838x_eth_write(s, addr, val)) {
+        return;
     }
 
     window = rtl838x_table_window(addr);
@@ -445,7 +573,6 @@ static const MemoryRegionOps rtl838x_switch_ops = {
 static void rtl838x_switch_reset(DeviceState *dev)
 {
     RTL838xSwitchState *s = RTL838X_SWITCH(dev);
-    uint32_t link = 1u << SW_CPU_PORT;
 
     memset(s->regs, 0, sizeof(s->regs));
 
@@ -462,13 +589,8 @@ static void rtl838x_switch_reset(DeviceState *dev)
 
     s->regs[SW_THERMAL_RESULT / 4] = SW_THERMAL_VALID | SW_THERMAL_DEGREES;
 
-    for (unsigned p = SW_PHY_PORT_FIRST; p <= SW_PHY_PORT_LAST; p++) {
-        link |= 1u << p;
-    }
-    s->regs[SW_MAC_LINK_STS / 4] = link;
-
-    for (unsigned w = 0; w < SW_NUM_TABLE_WINDOWS; w++) {
-        for (unsigned t = 0; t < SW_TABLES_PER_WINDOW; t++) {
+    for (unsigned w = 0; w < RTL838X_SW_TABLE_WINDOWS; w++) {
+        for (unsigned t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
             const RTL838xTableDesc *d = &sw_table_windows[w].tables[t];
 
             if (d->width) {
@@ -479,6 +601,8 @@ static void rtl838x_switch_reset(DeviceState *dev)
     }
 
     rtl838x_phy_reset(s);
+    rtl838x_eth_reset(s);
+    rtl838x_fwd_reset(s);
     qemu_set_irq(s->irq, 0);
 }
 
@@ -486,8 +610,8 @@ static void rtl838x_switch_realize(DeviceState *dev, Error **errp)
 {
     RTL838xSwitchState *s = RTL838X_SWITCH(dev);
 
-    for (unsigned w = 0; w < SW_NUM_TABLE_WINDOWS; w++) {
-        for (unsigned t = 0; t < SW_TABLES_PER_WINDOW; t++) {
+    for (unsigned w = 0; w < RTL838X_SW_TABLE_WINDOWS; w++) {
+        for (unsigned t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
             const RTL838xTableDesc *d = &sw_table_windows[w].tables[t];
 
             if (d->width) {
@@ -495,6 +619,8 @@ static void rtl838x_switch_realize(DeviceState *dev, Error **errp)
             }
         }
     }
+
+    rtl838x_fwd_realize(s);
 }
 
 static void rtl838x_switch_init(Object *obj)
@@ -504,17 +630,28 @@ static void rtl838x_switch_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rtl838x_switch_ops, s,
                           TYPE_RTL838X_SWITCH, RTL838X_SW_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+
+    /*
+     * Two interrupts, and they are not the same line: the switch core raises
+     * INTC 20 for link changes, while the CPU-port DMA engine raises INTC 24,
+     * which is what the ethernet node in the device tree asks for.
+     */
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->eth_irq);
 }
 
 static const VMStateDescription vmstate_rtl838x_switch = {
     .name = TYPE_RTL838X_SWITCH,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(regs, RTL838xSwitchState, SW_REGS),
-        VMSTATE_UINT16_2DARRAY(phy, RTL838xSwitchState, SW_NUM_PHYS,
-                               SW_PHY_REGS),
+        VMSTATE_UINT32_ARRAY(regs, RTL838xSwitchState, RTL838X_SW_REGS),
+        VMSTATE_UINT16_2DARRAY(phy, RTL838xSwitchState, RTL838X_SW_NUM_PORTS,
+                               RTL838X_SW_PHY_REGS),
+        VMSTATE_UINT32_ARRAY(rx_cursor, RTL838xSwitchState,
+                             RTL838X_ETH_RX_RINGS),
+        VMSTATE_UINT32_ARRAY(tx_cursor, RTL838xSwitchState,
+                             RTL838X_ETH_TX_RINGS),
         VMSTATE_END_OF_LIST()
     }
 };

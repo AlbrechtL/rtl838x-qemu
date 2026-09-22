@@ -94,7 +94,107 @@ struct RTL838xIntcState {
 /* Watchdog. */
 #define TYPE_RTL838X_WDT "rtl838x-wdt"
 
-/* Switch core window: syscon, PLLs, table engine, MDIO, PHYs. */
+/*
+ * Switch core window: syscon, PLLs, table engine, MDIO, PHYs, the CPU-port
+ * DMA engine and the forwarding engine.  The device tree gives the ethernet
+ * node no "reg" of its own -- every register the NIC driver touches lives in
+ * this one window -- so all of it is modelled by a single device, split over
+ * rtl838x_switch.c (the window itself), rtl838x_eth.c (the CPU-port DMA
+ * engine) and rtl838x_fwd.c (what the silicon does between the ports).
+ */
 #define TYPE_RTL838X_SWITCH "rtl838x-switch"
+OBJECT_DECLARE_SIMPLE_TYPE(RTL838xSwitchState, RTL838X_SWITCH)
+
+/*
+ * One front-panel port: an internal PHY plus a QEMU network backend.  The
+ * board creates eight of them, and each claims the next unused -nic, so
+ * backends bind to lan1, lan2, ... in command-line order.
+ */
+#define TYPE_RTL838X_PORT "rtl838x-port"
+typedef struct RTL838xPortState RTL838xPortState;
+
+#define RTL838X_SW_REGS         (RTL838X_SW_SIZE / 4)
+
+/*
+ * Port numbering is the hardware's, not Linux's: the eight RTL8218B ports the
+ * device tree labels lan1..lan8 are ports 8..15, and the CPU port is 28.
+ */
+#define RTL838X_SW_PORT_FIRST   8
+#define RTL838X_SW_PORT_LAST    15
+#define RTL838X_SW_NUM_PORTS    (RTL838X_SW_PORT_LAST - RTL838X_SW_PORT_FIRST + 1)
+#define RTL838X_SW_CPU_PORT     28
+#define RTL838X_SW_PHY_REGS     32
+
+/* Table access engine: three command/data window pairs, four tables each. */
+#define RTL838X_SW_TABLE_WINDOWS        3
+#define RTL838X_SW_TABLES_PER_WINDOW    4
+
+/* Table identifiers, as (window, type) pairs of the array in rtl838x_switch.c. */
+#define RTL838X_TBL_VLAN_WINDOW         1
+#define RTL838X_TBL_VLAN_TYPE           0
+#define RTL838X_TBL_MSTI_WINDOW         1
+#define RTL838X_TBL_MSTI_TYPE           2
+#define RTL838X_TBL_UNTAG_WINDOW        2
+#define RTL838X_TBL_UNTAG_TYPE          0
+#define RTL838X_TBL_MC_PMSK_WINDOW      0
+#define RTL838X_TBL_MC_PMSK_TYPE        2
+
+/* CPU-port DMA engine: the driver programs two rings in each direction. */
+#define RTL838X_ETH_RX_RINGS    2
+#define RTL838X_ETH_TX_RINGS    2
+
+struct RTL838xSwitchState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;       /* INTC 20: switch core, link change */
+    qemu_irq eth_irq;   /* INTC 24: CPU-port DMA */
+
+    uint32_t regs[RTL838X_SW_REGS];
+    uint16_t phy[RTL838X_SW_NUM_PORTS][RTL838X_SW_PHY_REGS];
+
+    uint32_t *table[RTL838X_SW_TABLE_WINDOWS][RTL838X_SW_TABLES_PER_WINDOW];
+
+    /* Front-panel ports, indexed from RTL838X_SW_PORT_FIRST. */
+    RTL838xPortState *port[RTL838X_SW_NUM_PORTS];
+
+    /* Where the DMA engine left off in each ring, in entries. */
+    uint32_t rx_cursor[RTL838X_ETH_RX_RINGS];
+    uint32_t tx_cursor[RTL838X_ETH_TX_RINGS];
+
+    /*
+     * Forwarding database.  The hardware layout is an 8192x4 hash plus a CAM
+     * with no valid bit and a bespoke hash function, so this is a plain
+     * software table instead; see rtl838x_fwd.c.
+     */
+    GHashTable *fdb;
+};
+
+/* rtl838x_switch.c */
+void rtl838x_switch_attach_port(RTL838xSwitchState *s, unsigned port,
+                                RTL838xPortState *p);
+void rtl838x_switch_link_changed(RTL838xSwitchState *s, unsigned port);
+bool rtl838x_switch_link_up(RTL838xSwitchState *s, unsigned port);
+uint32_t *rtl838x_switch_table_row(RTL838xSwitchState *s, unsigned window,
+                                   unsigned type, uint32_t index);
+
+/* rtl838x_port.c */
+bool rtl838x_port_link_up(RTL838xPortState *p);
+void rtl838x_port_send(RTL838xPortState *p, const uint8_t *buf, size_t len);
+
+/* rtl838x_eth.c: the CPU-port DMA engine. */
+bool rtl838x_eth_write(RTL838xSwitchState *s, hwaddr addr, uint32_t val);
+void rtl838x_eth_reset(RTL838xSwitchState *s);
+void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
+                        unsigned reason, const uint8_t *buf, size_t len);
+
+/* rtl838x_fwd.c: the forwarding engine. */
+void rtl838x_fwd_realize(RTL838xSwitchState *s);
+void rtl838x_fwd_reset(RTL838xSwitchState *s);
+void rtl838x_fwd_flush(RTL838xSwitchState *s, int port);
+void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
+                         const uint8_t *buf, size_t len);
+void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
+                          uint32_t dpm, bool as_dpm);
 
 #endif /* HW_MIPS_RTL838X_H */

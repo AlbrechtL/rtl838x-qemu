@@ -17,11 +17,18 @@ mkdir -p "$qemu/include/hw/mips"
 cp "$root"/src/include/hw/mips/*.h "$qemu/include/hw/mips/"
 
 patch="$root/patches/rtl838x.patch"
+
+# Restore the upstream files the patch touches before applying it.  The patch
+# is the only thing that edits them, so nothing is lost -- and without this,
+# changing the patch leaves a tree where neither it nor its predecessor
+# applies, which looks exactly like upstream drift but is not.
+git -C "$qemu" apply --numstat "$patch" | awk '{ print $3 }' | while read -r f; do
+    git -C "$qemu" checkout -- "$f" 2>/dev/null || true
+done
+
 if git -C "$qemu" apply --check "$patch" 2>/dev/null; then
     git -C "$qemu" apply "$patch"
     echo "sync: applied patches/rtl838x.patch"
-elif git -C "$qemu" apply --reverse --check "$patch" 2>/dev/null; then
-    : # already applied
 else
     echo "sync: patches/rtl838x.patch no longer applies -- likely upstream drift after a qemu rebase, needs regenerating" >&2
     exit 1

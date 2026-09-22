@@ -22,10 +22,12 @@
 #include "hw/core/clock.h"
 #include "hw/core/irq.h"
 #include "hw/core/loader.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/unimp.h"
 #include "hw/mips/mips.h"
 #include "hw/mips/rtl838x.h"
+#include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -219,11 +221,34 @@ static void rtl838x_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(intc, RTL838X_IRQ_GPIO));
 
+    /*
+     * The switch core, and with it the CPU-port DMA engine: the device tree
+     * gives the ethernet node no reg of its own, so both live in this one
+     * window -- but not on one interrupt.  The core raises INTC 20 when a link
+     * changes, the DMA engine INTC 24 when a ring needs attention.
+     */
     dev = qdev_new(TYPE_RTL838X_SWITCH);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_SW_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(intc, RTL838X_IRQ_SWITCH));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                       qdev_get_gpio_in(intc, RTL838X_IRQ_ETH));
+
+    /*
+     * The eight front-panel ports the device tree labels lan1..lan8.  Each
+     * claims the next unused -nic, so backends bind in command-line order; a
+     * port that claims nothing has no cable in it and reports no carrier.
+     */
+    for (unsigned i = 0; i < RTL838X_SW_NUM_PORTS; i++) {
+        DeviceState *port = qdev_new(TYPE_RTL838X_PORT);
+
+        qdev_prop_set_uint8(port, "port", RTL838X_SW_PORT_FIRST + i);
+        object_property_set_link(OBJECT(port), "switch", OBJECT(dev),
+                                 &error_abort);
+        qemu_configure_nic_device(port, true, NULL);
+        qdev_realize_and_unref(port, NULL, &error_fatal);
+    }
 
     /*
      * ns16550a, reg-shift 2, byte-wide registers, clocked from LXB.
@@ -258,6 +283,14 @@ static void rtl838x_machine_init(MachineClass *mc)
     mc->init = rtl838x_init;
     /* 4KEc plus MIPS16e; see patches/rtl838x.patch for why that matters. */
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("rtl8380");
+    /*
+     * QEMU adds a default NIC when the command line asks for no networking at
+     * all, and lan1 claims it, so a bare boot comes up with user networking on
+     * the first port.  Naming the model here is what makes that deliberate
+     * rather than incidental; "-nic none" gives a switch with nothing plugged
+     * into it.
+     */
+    mc->default_nic = TYPE_RTL838X_PORT;
     mc->default_ram_id = "rtl838x.ram";
     mc->default_ram_size = 128 * MiB;
     mc->max_cpus = 1;
