@@ -193,6 +193,12 @@ def main():
         tests.append(check("SoC is identified as RTL8380M",
                            "RTL8380M" in cpu, cpu.strip()))
 
+        # No -drive if=mtd: the flash is there, erased, and the kernel
+        # still finds the chip and the partitions its device tree lists.
+        mtd = con.run("cat /proc/mtd")
+        tests.append(check("the SPI-NOR flash is detected",
+                           '"firmware"' in mtd, mtd.strip()))
+
         ports = ["lan%d" % i for i in range(1, 9)]
 
         links = con.run("echo /sys/class/net/*")

@@ -6,12 +6,15 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
 own QEMU network device, frames cross between them and the CPU, and VLAN
-membership, spanning tree and BPDU trapping all behave.
+membership, spanning tree and BPDU trapping all behave. The SPI-NOR flash is
+modelled too, so a firmware installed into it boots, keeps its configuration,
+and can be upgraded.
 
 ```
 $ ./rtl838x.sh test
 reaches the console prompt               PASS
 SoC is identified as RTL8380M            PASS
+the SPI-NOR flash is detected            PASS
 lan1..lan8 exist                         PASS
 the seven cabled ports are up            PASS
 an uncabled port has no carrier          PASS
@@ -90,6 +93,45 @@ what running spanning tree against something other than itself needs:
 is but `tap` and host-facing `socket` backends need the container to reach the
 host — or just run `out/qemu/bin/qemu-system-mips` directly.
 
+## Flash
+
+The GS1900-8's 16 MiB SPI-NOR is QEMU's `m25p80` model of a Macronix
+MX25L12855E: same size, 64 KiB sectors, and a JEDEC ID that the kernel
+recognises without SFDP tables (the MX25L12805D's ID is shared with parts that
+have them, so a current kernel insists on reading tables QEMU's model of that
+chip does not have). It sits behind the controller `spi-realtek-rtl.c` drives,
+modelled closely enough for the kernel's `spi-nor` driver and everything on
+top of it: the partitions, `mtdsplit`, squashfs and JFFS2, `flashcp`,
+`sysupgrade` and SWUpdate.
+
+Its contents come from `-drive if=mtd`, a raw file of exactly 16 MiB. Without
+one the flash starts erased and is lost when QEMU exits. An erased flash is all
+`0xff`:
+
+```sh
+tr '\000' '\377' < /dev/zero | head -c 16M > flash.bin
+```
+
+With a flash and no `-kernel`, the machine does what the stock bootloader does
+with `bootpartition=0`: it loads the uImage at `0x260000`, the start of the
+first image slot, and starts it. It does so on every reset, so after an
+upgrade the reboot starts the new firmware. With `-kernel`, the kernel is
+booted instead, on every reset too, and the flash is just there to be
+installed to -- the way a TFTP-booted initramfs installs a firmware on the real
+switch:
+
+```sh
+qemu-system-mips -M rtl838x -m 128 -nographic -no-reboot \
+    -kernel <initramfs image> -drive if=mtd,format=raw,file=flash.bin
+# install, then boot what was installed:
+qemu-system-mips -M rtl838x -m 128 -nographic \
+    -drive if=mtd,format=raw,file=flash.bin
+```
+
+`-drive if=mtd,...,snapshot=on` keeps every write in a temporary file instead,
+so the flash file is left as it was when QEMU exits, while a reboot inside
+QEMU still sees the writes.
+
 ## How the image boots
 
 `images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
@@ -102,7 +144,8 @@ it down:
 | `0x515c` | LZMA stream holding a 17 MB kernel with its device tree appended |
 
 The machine parses that header, copies the payload to `0x80100000` and starts
-executing, so `rt-loader` runs exactly as it does on the real switch. ELF
+executing, so `rt-loader` runs exactly as it does on the real switch. From
+flash it does the same with the uImage at `0x260000`, see [Flash](#flash). ELF
 `vmlinux` files and raw kernels are also accepted.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
@@ -119,7 +162,7 @@ time by `scripts/sync.sh`.
 | Interrupt controller | `0x18003000` | 32 sources onto 5 outputs, wired to MIPS IP2..IP6 |
 | Otto timer | `0x18003100` | Five count-up timers; clocksource *and* clockevent |
 | Memory controller | `0x18001000` | Reports 128 MiB to both rt-loader and the kernel |
-| SPI-NOR controller | `0x18001200` | Stub, reports "ready" (see below) |
+| SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash) |
 | UART | `0x18002000` | 16550, reg-shift 2 |
 | Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
 | GPIO | `0x18003500` | 24 lines |
@@ -207,9 +250,9 @@ guest sees through the PHY is the backend's.
   rate limiting, so anything measuring bandwidth or priority measures the host.
 * The RTL8231 GPIO expander on the bit-banged MDIO bus is absent, so the reset
   button and the system LED do not exist.
-* The SPI-NOR controller answers but has no flash behind it, so there is no
-  persistent configuration and `sysupgrade` cannot work. Fine for initramfs
-  images.
+* The flash has no memory-mapped window, which only the stock bootloader
+  reads through, and the machine loads only the first image slot at
+  `0x260000`; `bootpartition` in the U-Boot environment is not consulted.
 * Migration saves the register window, the PHYs and the ring cursors, but not
   the table engine's contents or the forwarding database, so a restored machine
   forgets what it had learned.

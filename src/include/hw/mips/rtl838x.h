@@ -8,6 +8,7 @@
 #define HW_MIPS_RTL838X_H
 
 #include "hw/core/sysbus.h"
+#include "net/net.h"
 #include "qom/object.h"
 
 /*
@@ -40,6 +41,16 @@
 
 /* Kernel entry point / uImage load address for this target. */
 #define RTL838X_KERNEL_LOAD     0x80100000
+
+/*
+ * The SPI-NOR flash: its model, and where in it the stock bootloader looks
+ * for the uImage it boots.  0x260000 is the GS1900's first image slot, the
+ * one "bootpartition=0" selects and the device tree's "firmware" partition
+ * starts at.
+ */
+#define RTL838X_FLASH_TYPE      "mx25l12855e"
+#define RTL838X_FLASH_SIZE      (16 * 1024 * 1024)
+#define RTL838X_FLASH_FIRMWARE  0x260000
 
 /* SoC interrupt numbers, as used by the device tree. */
 #define RTL838X_IRQ_TIMER4      15
@@ -152,6 +163,9 @@ struct RTL838xSwitchState {
 
     uint32_t regs[RTL838X_SW_REGS];
     uint16_t phy[RTL838X_SW_NUM_PORTS][RTL838X_SW_PHY_REGS];
+
+    /* The switch's own address, as the bootloader leaves it programmed. */
+    MACAddr macaddr;
 
     uint32_t *table[RTL838X_SW_TABLE_WINDOWS][RTL838X_SW_TABLES_PER_WINDOW];
 

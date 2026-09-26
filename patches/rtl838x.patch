@@ -2,7 +2,7 @@ diff --git a/hw/mips/Kconfig b/hw/mips/Kconfig
 index b59cb2f..41f7f66 100644
 --- a/hw/mips/Kconfig
 +++ b/hw/mips/Kconfig
-@@ -86,3 +86,10 @@ config MIPS_BOSTON
+@@ -86,3 +86,12 @@ config MIPS_BOSTON
  
  config FW_CFG_MIPS
      bool
@@ -12,6 +12,8 @@ index b59cb2f..41f7f66 100644
 +    default y
 +    depends on MIPS && !MIPS64 && TARGET_BIG_ENDIAN
 +    select SERIAL_MM
++    select SSI
++    select SSI_M25P80
 +    select UNIMP
 diff --git a/hw/mips/meson.build b/hw/mips/meson.build
 index 390f0fd..456188f 100644

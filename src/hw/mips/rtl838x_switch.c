@@ -29,6 +29,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "hw/mips/rtl838x.h"
 #include "migration/vmstate.h"
@@ -570,6 +571,9 @@ static const MemoryRegionOps rtl838x_switch_ops = {
     .impl.max_access_size = 4,
 };
 
+/* MAC_ADDR_CTRL, MAC_ADDR_CTRL_ALE, MAC_ADDR_CTRL_MAC: high 16 bits, low 32 */
+static const hwaddr sw_mac_regs[] = { 0xa9ec, 0x6b04, 0xa320 };
+
 static void rtl838x_switch_reset(DeviceState *dev)
 {
     RTL838xSwitchState *s = RTL838X_SWITCH(dev);
@@ -588,6 +592,22 @@ static void rtl838x_switch_reset(DeviceState *dev)
     s->regs[SW_PLL_MEM_CTRL1 / 4] = 0x14018c80;
 
     s->regs[SW_THERMAL_RESULT / 4] = SW_THERMAL_VALID | SW_THERMAL_DEGREES;
+
+    /*
+     * The stock bootloader programs the switch's MAC address into the three
+     * places the driver keeps it, and the driver takes it from the first
+     * when the device tree has none -- which the GS1900's does not.  Without
+     * it the driver picks a random one on every boot, and whatever sits on
+     * the other side of a port, QEMU's user network included, keeps sending
+     * to the address from before the reboot.
+     */
+    for (unsigned i = 0; i < ARRAY_SIZE(sw_mac_regs); i++) {
+        const uint8_t *a = s->macaddr.a;
+
+        s->regs[sw_mac_regs[i] / 4] = (a[0] << 8) | a[1];
+        s->regs[sw_mac_regs[i] / 4 + 1] =
+            ((uint32_t)a[2] << 24) | (a[3] << 16) | (a[4] << 8) | a[5];
+    }
 
     for (unsigned w = 0; w < RTL838X_SW_TABLE_WINDOWS; w++) {
         for (unsigned t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
@@ -656,10 +676,15 @@ static const VMStateDescription vmstate_rtl838x_switch = {
     }
 };
 
+static const Property rtl838x_switch_properties[] = {
+    DEFINE_PROP_MACADDR("macaddr", RTL838xSwitchState, macaddr),
+};
+
 static void rtl838x_switch_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    device_class_set_props(dc, rtl838x_switch_properties);
     dc->realize = rtl838x_switch_realize;
     dc->vmsd = &vmstate_rtl838x_switch;
     device_class_set_legacy_reset(dc, rtl838x_switch_reset);

@@ -3,7 +3,10 @@
  *
  * A single-core big-endian MIPS32r2 SoC used in small managed switches, e.g.
  * the Zyxel GS1900-8 that OpenWrt targets.  There is no firmware to emulate:
- * the machine loads a kernel image directly and starts executing it.
+ * the machine either loads the kernel image given with -kernel, or does what
+ * the stock bootloader does, and loads the uImage from the flash's first
+ * image slot -- on every reset, so that a reboot after a firmware update
+ * starts the new firmware.
  *
  * The kernel carries its device tree appended to itself
  * (CONFIG_MIPS_RAW_APPENDED_DTB=y), so this board never builds or passes a
@@ -27,8 +30,13 @@
 #include "hw/misc/unimp.h"
 #include "hw/mips/mips.h"
 #include "hw/mips/rtl838x.h"
+#include "hw/ssi/ssi.h"
+#include "exec/tb-flush.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
+#include "system/runstate.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "elf.h"
@@ -50,14 +58,36 @@
 typedef struct ResetData {
     MIPSCPU *cpu;
     uint64_t vector;
+    BlockBackend *flash;    /* boot from here, when there is no -kernel */
 } ResetData;
+
+static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp);
 
 static void main_cpu_reset(void *opaque)
 {
     ResetData *s = opaque;
     CPUMIPSState *env = &s->cpu->env;
 
+    if (s->flash) {
+        Error *err = NULL;
+
+        s->vector = rtl838x_load_flash(s->flash, &err);
+        if (err) {
+            /* The stock bootloader would stop at its prompt; stop instead. */
+            error_report_err(err);
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
+    }
+
     cpu_reset(CPU(s->cpu));
+    /*
+     * Forget the code the previous boot ran.  Its translations are still
+     * cached, so every page they came from is write-protected for TCG, and
+     * the next boot, which rewrites that memory from rt-loader onwards,
+     * takes the slow path on every store: freeing the kernel's init memory
+     * alone took over ten seconds after a reboot.
+     */
+    queue_tb_flush(CPU(s->cpu));
     env->active_tc.PC = s->vector & ~(target_ulong)1;
 
     /*
@@ -76,6 +106,76 @@ static uint32_t be32_at(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
+}
+
+/*
+ * Checks a legacy uImage header against the size of what it came from.
+ * Returns the payload size, or 0 with errp set.
+ */
+static uint32_t rtl838x_check_uimage(const uint8_t *hdr, uint64_t len,
+                                     const char *what, Error **errp)
+{
+    uint32_t payload = be32_at(hdr + 12);
+
+    if (payload > len - UIMAGE_HEADER_SIZE) {
+        error_setg(errp, "uImage in %s is truncated: header claims %u bytes",
+                   what, payload);
+        return 0;
+    }
+    if (hdr[31] != 0) {
+        error_setg(errp, "uImage in %s has a compressed payload (type %u); "
+                   "this machine expects the uncompressed rt-loader",
+                   what, hdr[31]);
+        return 0;
+    }
+    return payload;
+}
+
+/*
+ * The stock bootloader's part: the uImage at the start of the flash's first
+ * image slot, copied to its load address.  Reads the flash through the
+ * block layer, so a firmware update the guest wrote is what the next reset
+ * boots.  Returns the entry point.
+ */
+static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
+{
+    const uint64_t len = RTL838X_FLASH_SIZE - RTL838X_FLASH_FIRMWARE;
+    uint8_t hdr[UIMAGE_HEADER_SIZE];
+    g_autofree uint8_t *payload = NULL;
+    uint32_t magic, size;
+    uint64_t load, ep;
+
+    /* Writes the flash model has started but not finished. */
+    blk_drain(blk);
+
+    if (blk_pread(blk, RTL838X_FLASH_FIRMWARE, sizeof(hdr), hdr, 0) < 0) {
+        error_setg(errp, "could not read the flash");
+        return 0;
+    }
+    magic = be32_at(hdr);
+    if (magic != UIMAGE_MAGIC && magic != UIMAGE_MAGIC_RTL) {
+        error_setg(errp, "no uImage in flash at 0x%x (magic 0x%08x): "
+                   "nothing to boot; install a firmware first, or boot "
+                   "one with -kernel", RTL838X_FLASH_FIRMWARE, magic);
+        return 0;
+    }
+    size = rtl838x_check_uimage(hdr, len, "flash", errp);
+    if (!size) {
+        return 0;
+    }
+    load = be32_at(hdr + 16);
+    ep = be32_at(hdr + 20);
+
+    payload = g_malloc(size);
+    if (blk_pread(blk, RTL838X_FLASH_FIRMWARE + UIMAGE_HEADER_SIZE, size,
+                  payload, 0) < 0) {
+        error_setg(errp, "could not read the flash");
+        return 0;
+    }
+    address_space_write(&address_space_memory,
+                        cpu_mips_kseg0_to_phys(NULL, load),
+                        MEMTXATTRS_UNSPECIFIED, payload, size);
+    return ep;
 }
 
 /*
@@ -102,22 +202,11 @@ static uint64_t rtl838x_load_kernel(MachineState *machine)
         uint32_t magic = be32_at(hdr);
 
         if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL) {
-            uint32_t payload = be32_at(hdr + 12);
             uint64_t load = be32_at(hdr + 16);
             uint64_t ep = be32_at(hdr + 20);
             g_autofree char *name = g_strndup(buf + 32, 32);
-
-            if (payload > len - UIMAGE_HEADER_SIZE) {
-                error_report("uImage '%s' is truncated: header claims %u bytes",
-                             filename, payload);
-                exit(1);
-            }
-            if (hdr[31] != 0) {
-                error_report("uImage '%s' payload is compressed (type %u); "
-                             "this machine expects the uncompressed rt-loader",
-                             filename, hdr[31]);
-                exit(1);
-            }
+            uint32_t payload = rtl838x_check_uimage(hdr, len, filename,
+                                                    &error_fatal);
 
             info_report("loading uImage '%s' (%u bytes) at 0x%" PRIx64
                         ", entry 0x%" PRIx64, name, payload, load, ep);
@@ -145,7 +234,9 @@ static void rtl838x_init(MachineState *machine)
     MemoryRegion *sram = g_new(MemoryRegion, 1);
     MemoryRegion *sram_alias = g_new(MemoryRegion, 1);
     ResetData *reset_info;
-    DeviceState *intc, *dev;
+    DeviceState *intc, *dev, *flash;
+    DriveInfo *flash_dinfo;
+    MACAddr mac;
     MIPSCPU *cpu;
     CPUMIPSState *env;
     Clock *cpuclk;
@@ -195,6 +286,20 @@ static void rtl838x_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_MC_BASE);
 
+    /*
+     * The SPI-NOR flash on chip select 0 of the controller in that window,
+     * backed by "-drive if=mtd" when there is one.
+     */
+    flash_dinfo = drive_get(IF_MTD, 0, 0);
+    flash = qdev_new(RTL838X_FLASH_TYPE);
+    if (flash_dinfo) {
+        qdev_prop_set_drive_err(flash, "drive",
+                                blk_by_legacy_dinfo(flash_dinfo), &error_fatal);
+    }
+    qdev_realize_and_unref(flash, qdev_get_child_bus(dev, "spi"), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0));
+
     dev = qdev_new(TYPE_RTL838X_TIMER);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_TIMER_BASE);
@@ -228,6 +333,17 @@ static void rtl838x_init(MachineState *machine)
      * changes, the DMA engine INTC 24 when a ring needs attention.
      */
     dev = qdev_new(TYPE_RTL838X_SWITCH);
+    /*
+     * The switch's MAC address.  The real switch has its own in the U-Boot
+     * environment; here it is a random, locally administered one, so that
+     * switches started side by side differ, but it is fixed for the life of
+     * the QEMU process, so that a reboot does not change it.
+     */
+    for (unsigned i = 0; i < 6; i++) {
+        mac.a[i] = g_random_int_range(0, 256);
+    }
+    mac.a[0] = (mac.a[0] & 0xfc) | 0x02;
+    qdev_prop_set_macaddr(dev, "macaddr", mac.a);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_SW_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -274,6 +390,14 @@ static void rtl838x_init(MachineState *machine)
 
     if (machine->kernel_filename) {
         reset_info->vector = rtl838x_load_kernel(machine);
+    } else if (flash_dinfo) {
+        reset_info->flash = blk_by_legacy_dinfo(flash_dinfo);
+        /* Fail now rather than at the first reset, with no output. */
+        rtl838x_load_flash(reset_info->flash, &error_fatal);
+    } else {
+        error_report("nothing to boot: give a kernel image with -kernel, or "
+                     "a flash image with -drive if=mtd,format=raw,file=...");
+        exit(1);
     }
 }
 

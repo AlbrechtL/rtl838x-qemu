@@ -1,25 +1,36 @@
 /*
- * Realtek RTL838x memory controller and SPI-NOR controller stub
+ * Realtek RTL838x memory controller and SPI-NOR controller
  *
  * Covers 0x18001000..0x180012ff: the DRAM configuration registers that both
- * rt-loader and the kernel use to size memory, and the SPI-NOR controller.
+ * rt-loader and the kernel use to size memory, and the SPI-NOR controller
+ * with the board's flash chip behind it.
  *
- * The SPI part is a stub with one load-bearing detail.  spi-realtek-rtl.c
- * spins on the SFCSR ready bit with no timeout at all:
+ * The SPI controller is the one spi-realtek-rtl.c drives: a chip select bit
+ * per chip in SFCSR, a length field saying whether the next SFDR access moves
+ * one byte or four, and SFDR itself, which shifts that many bytes out or in,
+ * most significant byte first.  Transfers complete at once, so the ready bit
+ * always reads as set.  That bit is load-bearing: the driver spins on it with
+ * no timeout at all,
  *
  *     while (!(readl(REG(RTL_SPI_SFCSR)) & RTL_SPI_SFCSR_RDY)) cpu_relax();
  *
- * so a window that reads back as zero wedges the kernel during spi-nor probe,
- * with no output.  Reporting "always ready" and returning all-ones data makes
- * the JEDEC ID read fail cleanly instead, and boot continues.  Modelling the
- * flash for real is left for when persistent config / sysupgrade is wanted.
+ * so a controller that reads back as busy wedges the kernel during spi-nor
+ * probe, with no output.
+ *
+ * The flash is QEMU's m25p80 model of a Macronix MX25L12855E, 16 MiB with
+ * 64 KiB sectors, the geometry the GS1900's partition map is laid out for.
+ * Its contents come from "-drive if=mtd", which must be exactly 16 MiB;
+ * without one the flash starts erased and forgets everything when QEMU
+ * exits.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/mips/rtl838x.h"
+#include "hw/ssi/ssi.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 
@@ -41,16 +52,45 @@
 #define RTL838X_SPI_SFCR2       0x204
 #define RTL838X_SPI_SFCSR       0x208
 #define RTL838X_SPI_SFDR        0x20c
+#define RTL838X_SPI_SFCSR_CSB0  (1u << 31)  /* chip select 0, active low */
+#define RTL838X_SPI_SFCSR_LEN_SHIFT 28      /* bytes per SFDR access - 1 */
 #define RTL838X_SPI_SFCSR_RDY   (1u << 27)
 
 struct RTL838xSocMiscState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    SSIBus *spi;
+    qemu_irq spi_cs;
     uint32_t regs[RTL838X_SOCMISC_SIZE / 4];
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(RTL838xSocMiscState, RTL838X_SOCMISC)
+
+/* How many bytes the next SFDR access moves: SFCSR's length field plus one. */
+static unsigned rtl838x_spi_len(RTL838xSocMiscState *s)
+{
+    return ((s->regs[RTL838X_SPI_SFCSR / 4] >> RTL838X_SPI_SFCSR_LEN_SHIFT)
+            & 3) + 1;
+}
+
+/*
+ * Clocks len bytes through the bus, the most significant byte of the word
+ * first -- the order the driver asks for with SFCR's RBO and WBO bits, and
+ * the only one modelled.
+ */
+static uint32_t rtl838x_spi_xfer(RTL838xSocMiscState *s, uint32_t out)
+{
+    unsigned len = rtl838x_spi_len(s);
+    uint32_t in = 0;
+
+    for (unsigned i = 0; i < len; i++) {
+        unsigned shift = 24 - 8 * i;
+
+        in |= (ssi_transfer(s->spi, (out >> shift) & 0xff) & 0xff) << shift;
+    }
+    return in;
+}
 
 static uint64_t rtl838x_socmisc_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -61,7 +101,7 @@ static uint64_t rtl838x_socmisc_read(void *opaque, hwaddr addr, unsigned size)
         /* Never report busy; see the comment at the top of this file. */
         return s->regs[addr / 4] | RTL838X_SPI_SFCSR_RDY;
     case RTL838X_SPI_SFDR:
-        return 0xffffffff;
+        return rtl838x_spi_xfer(s, 0);
     default:
         return s->regs[addr / 4];
     }
@@ -76,6 +116,14 @@ static void rtl838x_socmisc_write(void *opaque, hwaddr addr, uint64_t val,
     case RTL838X_MC_MCR:
     case RTL838X_MC_DCR:
         /* Read-only to the guest: the board decides how much DRAM there is. */
+        break;
+    case RTL838X_SPI_SFCSR:
+        s->regs[addr / 4] = val;
+        /* The bit is the level of the line, which the flash reads active low. */
+        qemu_set_irq(s->spi_cs, !!(val & RTL838X_SPI_SFCSR_CSB0));
+        break;
+    case RTL838X_SPI_SFDR:
+        rtl838x_spi_xfer(s, val);
         break;
     default:
         s->regs[addr / 4] = val;
@@ -99,6 +147,9 @@ static void rtl838x_socmisc_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[RTL838X_MC_DCR / 4] = RTL838X_MC_DCR_128MB;
+    /* Both chips deselected. */
+    s->regs[RTL838X_SPI_SFCSR / 4] = RTL838X_SPI_SFCSR_CSB0 | (1u << 30);
+    qemu_set_irq(s->spi_cs, 1);
 }
 
 static void rtl838x_socmisc_init(Object *obj)
@@ -108,6 +159,9 @@ static void rtl838x_socmisc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rtl838x_socmisc_ops, s,
                           TYPE_RTL838X_SOCMISC, RTL838X_SOCMISC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+
+    s->spi = ssi_create_bus(DEVICE(obj), "spi");
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->spi_cs);
 }
 
 static const VMStateDescription vmstate_rtl838x_socmisc = {
