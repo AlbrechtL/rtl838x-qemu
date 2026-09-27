@@ -3,6 +3,11 @@
 Runs OpenWrt for Realtek RTL838x switch SoCs in an emulator. The target is the
 Zyxel GS1900-8 image in `images/`, booted unmodified.
 
+The emulator is tested with the RTL8380M and RTL8382MI SoCs; other RTL838x SoCs
+may work as well. Both [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/)
+and [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/)
+can be run (the latter tested with Zyxel GS1900-8 hardware).
+
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
 own QEMU network device, frames cross between them and the CPU, and VLAN
