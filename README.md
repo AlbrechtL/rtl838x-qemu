@@ -3,12 +3,10 @@
 Runs OpenWrt for Realtek RTL838x switch SoCs in an emulator. The target is the
 Zyxel GS1900-8 image in `images/`, booted unmodified.
 
-The emulator is tested with the RTL8380M and RTL8382MI SoCs; other RTL838x SoCs
-may work as well. Both [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/)
-and [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/)
-can be run (the latter tested with Zyxel GS1900-8 hardware). So can Zyxel's own
-firmware for the GS1900-8, tested with V2.90(AAHH.2)C0: see
-[Vendor firmware](#vendor-firmware).
+[OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
+[Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/)
+and Zyxel's own firmware for the GS1900-8 all run; see
+[Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
@@ -34,6 +32,37 @@ guest clock advances                     PASS
 otto timer is the clocksource            PASS
 no kernel oops or unhandled faults       PASS
 ```
+
+## Contents
+
+* [Tested firmware](#tested-firmware)
+* [Quick start](#quick-start)
+* [Networking](#networking)
+* [Flash](#flash)
+* [Vendor firmware](#vendor-firmware)
+  * [Why it wants a flash](#why-it-wants-a-flash)
+  * [What it took](#what-it-took)
+  * [What does not work](#what-does-not-work)
+* [How the image boots](#how-the-image-boots)
+* [What is modelled](#what-is-modelled)
+* [How the data path works](#how-the-data-path-works)
+* [Known gaps](#known-gaps)
+* [Layout](#layout)
+* [Debugging](#debugging)
+* [License](#license)
+
+## Tested firmware
+
+| Firmware | Built for | SoC | Tested |
+|---|---|---|---|
+| OpenWrt snapshot, `openwrt-realtek-rtl838x-zyxel_gs1900-8-a1-initramfs-kernel.bin` (the image in `images/`) | Zyxel GS1900-8 (A1) | RTL8380M | In the emulator, by `./rtl838x.sh test` |
+| [Ethernet Switch OS](https://albrechtl.github.io/ethernet-switch-os/) | Zyxel GS1900-8 | RTL8380M | In the emulator, and the same image on a real GS1900-8 |
+| Ethernet Switch OS | an RTL8382MI board | RTL8382MI | In the emulator |
+| Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Vendor firmware](#vendor-firmware) |
+
+Whatever an image was built for, the machine identifies itself as an RTL8380M
+and has the GS1900-8's eight ports and 16 MiB flash. Images for other RTL838x
+boards may work as well, as long as their device tree asks for nothing more.
 
 ## Quick start
 
@@ -97,9 +126,14 @@ what running spanning tree against something other than itself needs:
 ./rtl838x.sh run -nic socket,connect=127.0.0.1:1234       # switch B, lan1
 ```
 
-`./rtl838x.sh run` puts QEMU in a container, so `user` networking works as it
-is but `tap` and host-facing `socket` backends need the container to reach the
-host — or just run `out/qemu/bin/qemu-system-mips` directly.
+`./rtl838x.sh run`, `run-log` and `run-flash` put QEMU in a container that
+shares the host's network, so ports behave as if QEMU ran on the host itself:
+`hostfwd`, `socket` `listen=` and `connect=`, and `-s`/`-gdb` all open or
+reach ports on the host, and two instances on the same host find each other at
+`127.0.0.1`. `tap` still needs `/dev/net/tun` and the right to use it, which
+the container does not have; for that, run `out/qemu/bin/qemu-system-mips`
+directly. `test` and `test-stock` keep a network of their own, since they
+drive everything from inside the container.
 
 ## Flash
 
@@ -191,11 +225,10 @@ Port  Name                 Status      Vlan  Duplex  Speed    Type
 The account is the factory one, `admin` / `1234`, and the address the factory
 one too, 192.168.1.1. QEMU's user network can be renumbered to match, which
 makes the host 192.168.1.2 from the switch's side and puts the web interface
-on a local port:
+on <http://localhost:8080> once the console says `Press any key to continue`:
 
 ```sh
-out/qemu/bin/qemu-system-mips -M rtl838x,flash-model=mx25l12805d -m 128 \
-    -nographic -drive if=mtd,format=raw,file=flash.bin \
+./rtl838x.sh run-flash flash.bin -machine flash-model=mx25l12805d \
     -nic user,net=192.168.1.0/24,host=192.168.1.2,hostfwd=tcp::8080-192.168.1.1:80
 ```
 

@@ -30,6 +30,7 @@ image_guest=""      # path the container sees
 image_mount=""      # extra docker -v argument, when the image is outside the repo
 image_consumed=0    # whether the image came from the command line
 image_mode=ro       # how an image outside the repository is mounted
+container_net=""    # extra docker run arguments for the network
 
 die() {
     echo "rtl838x: $*" >&2
@@ -45,10 +46,18 @@ in_container() {
     tty="-i"
     [ -t 0 ] && tty="-it"
     # shellcheck disable=SC2086
-    "$DOCKER" run --rm $tty \
+    "$DOCKER" run --rm $tty $container_net \
         -v "$root:/work" -w /work $image_mount \
         -u "$(id -u):$(id -g)" -e HOME=/tmp \
         "$image" "$@"
+}
+
+# QEMU run by hand shares the host's network, and so does QEMU run from here:
+# hostfwd, socket listen= and connect=, -s and -gdb then open and reach ports
+# on the host, as they would without the container.  The tests keep a network
+# of their own: they drive everything from inside the container.
+with_host_network() {
+    container_net="--network host"
 }
 
 # Work out where a firmware image lives and how the container can reach it.
@@ -92,7 +101,8 @@ usage: ./rtl838x.sh <command> [arguments]
 
   build                   build qemu-system-mips with the rtl838x machine
   run [image] [args...]   boot a firmware image; extra arguments go to QEMU
-                          (leave the guest with Ctrl-A x)
+                          (leave the guest with Ctrl-A x); QEMU uses the
+                          host's network, so hostfwd ports open on the host
   run-log [image] [...]   boot with unimplemented-register logging to
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
@@ -102,7 +112,8 @@ usage: ./rtl838x.sh <command> [arguments]
                           installed and a U-Boot environment; extra arguments
                           go to "imgtool.py mkflash"
   run-flash <flash> [...] boot what is installed in a flash image, the way the
-                          stock bootloader does; writes go to the file
+                          stock bootloader does; writes go to the file; the
+                          host's network, as with run
   shell                   open a shell in the build container
   info [image]            summarise a firmware image
   dts [image]             print the device tree embedded in a firmware image
@@ -144,6 +155,7 @@ cmd_runtime_image() {
 
 run_qemu() {
     cmd_runtime_image
+    with_host_network
     echo "booting $image_host" >&2
     in_container "$RUNTIME" "$QEMU" \
         -M rtl838x -m 128 -nographic -no-reboot \
@@ -163,6 +175,7 @@ cmd_run_flash() {
     resolve_image "$1"
     shift
     cmd_runtime_image
+    with_host_network
     echo "booting from flash $image_host" >&2
     in_container "$RUNTIME" "$QEMU" \
         -M rtl838x -m 128 -nographic -no-reboot \
