@@ -11,9 +11,12 @@
  * The one thing it does keep is the forwarding database.  The hardware layout
  * is an 8192x4 hash plus a CAM with no valid bit and a hash function nobody
  * has written down, so reproducing it would be a lot of work for no observable
- * difference: a plain software table forwards identically.  The consequence is
- * worth knowing -- entries the bridge programs statically into the hardware L2
- * table are not consulted, only what we learn from traffic.
+ * difference: a plain software table forwards identically.  What the driver
+ * programs into the hardware table is not ignored, though: a unicast address
+ * nothing has been learned for is looked up among its static entries, with a
+ * scan rather than the hash.  That is how a switch's own address reaches the
+ * CPU when the CPU port does not learn -- the driver installs it -- and it is
+ * all a static entry is consulted for.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -43,6 +46,15 @@
  * VLAN and relies on this to hear who is asking for its address.
  */
 #define FWD_SPCL_TRAP_ARP_CTRL  0x698c
+
+/* The hardware L2 table and its CAM, and the entry bits read from them. */
+#define FWD_TBL_L2_WINDOW       0
+#define FWD_TBL_L2_TYPE         0
+#define FWD_TBL_L2_ROWS         8192
+#define FWD_TBL_L2_CAM_TYPE     1
+#define FWD_TBL_L2_CAM_ROWS     64
+#define FWD_L2_IP_MC            (3u << 21)
+#define FWD_L2_STATIC           (1u << 19)
 
 /* Spanning tree states, two bits per port in the MSTI table. */
 #define STP_DISABLED            0
@@ -172,13 +184,53 @@ static void fwd_learn(RTL838xSwitchState *s, unsigned fid, const uint8_t *mac,
     g_hash_table_replace(s->fdb, g_memdup2(&key, sizeof(key)), val);
 }
 
-/* The port an address was last seen on, or -1 if it has not been. */
+/*
+ * The port of a static unicast entry for mac in the hardware L2 table or its
+ * CAM, or -1.  An entry is three words: the MAC is spread over the second
+ * and third, and the first holds the port in [16:12], "static" in bit 19 and
+ * the two IP multicast type bits in [22:21].  The VLAN is not compared: the
+ * drivers install their own addresses once per VLAN, for the same port.
+ */
+static int fwd_lookup_static(RTL838xSwitchState *s, uint64_t mac)
+{
+    static const struct {
+        unsigned type, rows;
+    } tables[] = {
+        { FWD_TBL_L2_TYPE, FWD_TBL_L2_ROWS },
+        { FWD_TBL_L2_CAM_TYPE, FWD_TBL_L2_CAM_ROWS },
+    };
+
+    for (unsigned t = 0; t < ARRAY_SIZE(tables); t++) {
+        for (uint32_t i = 0; i < tables[t].rows; i++) {
+            uint32_t *r = rtl838x_switch_table_row(s, FWD_TBL_L2_WINDOW,
+                                                   tables[t].type, i);
+            uint64_t entry;
+
+            if (!r || (r[0] & FWD_L2_IP_MC) || !(r[0] & FWD_L2_STATIC)) {
+                continue;
+            }
+            entry = ((uint64_t)(r[1] & 0x0fffffff) << 20) | (r[2] >> 12);
+            if (entry == mac) {
+                return (r[0] >> 12) & 0x1f;
+            }
+        }
+    }
+    return -1;
+}
+
+/*
+ * The port an address was last seen on or is statically bound to, or -1 if
+ * neither.
+ */
 static int fwd_lookup(RTL838xSwitchState *s, unsigned fid, const uint8_t *mac)
 {
     guint64 key = ((guint64)fid << 48) | fwd_mac(mac);
     gpointer val = g_hash_table_lookup(s->fdb, &key);
 
-    return val ? (int)GPOINTER_TO_UINT(val) - 1 : -1;
+    if (val) {
+        return (int)GPOINTER_TO_UINT(val) - 1;
+    }
+    return fwd_lookup_static(s, fwd_mac(mac));
 }
 
 static gboolean fwd_flush_port(gpointer key, gpointer value, gpointer user)

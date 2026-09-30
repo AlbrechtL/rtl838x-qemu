@@ -106,8 +106,9 @@ usage: ./rtl838x.sh <command> [arguments]
   run-log [image] [...]   boot with unimplemented-register logging to
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
-  test-stock <image>      the same for a vendor (Zyxel .bix) image, which is
-                          installed into a scratch flash and booted from it
+  test-stock <image>      the same for a vendor image (Zyxel .bix, Teltonika
+                          TSW2xx), which is installed into a scratch flash and
+                          booted from it
   mkflash <image> <flash> write a 16 MiB flash image with the firmware
                           installed and a U-Boot environment; extra arguments
                           go to "imgtool.py mkflash"

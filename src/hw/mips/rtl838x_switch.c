@@ -15,7 +15,8 @@
  *   0x3370 bit 26  L2 table flush, spun on by rtldsa_838x_fast_age()
  *   0x003c bits2,3 NIC reset (bounded at 1 s, but wrong if it never clears)
  *
- * so every one of those has to complete instantly here.
+ * so every one of those has to complete instantly here.  Teltonika's kernel
+ * adds a fourth, 0xe3e4 bit 15.
  *
  * What is modelled here: identification, clocks, thermal, the self-clearing
  * and write-one-to-clear bits, the table access engine with real backing
@@ -97,6 +98,15 @@
 #define SW_L2_TBL_FLUSH_CTRL    0x3370
 #define SW_L2_TBL_FLUSH_EXEC    (1u << 26)
 #define SW_L2_TBL_FLUSH_BY_PORT (1u << 23)
+/*
+ * An indirect access engine OpenWrt's upstream driver never touches, but
+ * Teltonika's 5.10 kernel does during DSA setup: address and data go into
+ * 0xe3e0..0xe3ec, the command into bits [13:12] of the second word, results
+ * come back in 0xe408..0xe414.  It spins on bit 15 with no timeout.  Nothing
+ * behind it is modelled; reads return zero.
+ */
+#define SW_IND_ACCESS_CTRL      0xe3e4
+#define SW_IND_ACCESS_EXEC      (1u << 15)
 
 /* Write-one-to-clear status registers. */
 #define SW_ISR_GLB_SRC          0x1148
@@ -128,7 +138,7 @@
 /* Reset values the forwarding engine reads; see rtl838x_switch_reset(). */
 #define SW_PORT_ISO_CTRL(p)     (0x4100 + (p) * 4)
 #define SW_ALL_PORTS            0x1fffffff
-#define SW_MC_PMSK_FLOOD_ROW    511
+#define SW_MC_PMSK_LAST_ROW     511
 
 #define SW_SMI_RUN              (1u << 0)
 #define SW_SMI_CMD_MASK         (3u << 1)
@@ -557,6 +567,10 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
         s->regs[addr / 4] = val & ~SW_ACL_CLR_EXEC;
         return;
 
+    case SW_IND_ACCESS_CTRL:
+        s->regs[addr / 4] = val & ~SW_IND_ACCESS_EXEC;
+        return;
+
     case SW_L2_TBL_FLUSH_CTRL:
         s->regs[addr / 4] = val & ~SW_L2_TBL_FLUSH_EXEC;
         /*
@@ -694,18 +708,25 @@ static void rtl838x_switch_reset(DeviceState *dev)
     }
 
     /*
-     * Out of reset nothing is isolated from anything, and the last row of
-     * the multicast port mask table -- the one L2_FLD_PMSK points at until
-     * told otherwise -- floods to every port.  Linux overwrites both before
-     * it lets a frame through.  The vendor SDK leaves the isolation matrix
-     * alone, and builds its flood mask by copying that row.
+     * Out of reset nothing is isolated from anything, and every row of the
+     * multicast port mask table floods to every port -- including the last
+     * one, which L2_FLD_PMSK points at until told otherwise.  Linux
+     * overwrites both before it lets a frame through.  The vendor SDK leaves
+     * the isolation matrix alone, and builds its flood mask by copying the
+     * last row.  Realtek's SDK in Teltonika's firmware relies on the other
+     * rows: it points broadcast flooding at row 504, by shifting the row
+     * number to where the RTL839x keeps it, which OpenWrt did too until
+     * 1b7fd8464c2b ("realtek: rtl838x: fix broadcast flooding with many
+     * multicast entries").  It works on the hardware because row 504 is
+     * never written.
      */
     for (unsigned p = 0; p <= RTL838X_SW_CPU_PORT; p++) {
         s->regs[SW_PORT_ISO_CTRL(p) / 4] = SW_ALL_PORTS;
     }
-    *rtl838x_switch_table_row(s, RTL838X_TBL_MC_PMSK_WINDOW,
-                              RTL838X_TBL_MC_PMSK_TYPE,
-                              SW_MC_PMSK_FLOOD_ROW) = SW_ALL_PORTS;
+    for (unsigned r = 0; r <= SW_MC_PMSK_LAST_ROW; r++) {
+        *rtl838x_switch_table_row(s, RTL838X_TBL_MC_PMSK_WINDOW,
+                                  RTL838X_TBL_MC_PMSK_TYPE, r) = SW_ALL_PORTS;
+    }
 
     rtl838x_phy_reset(s);
     rtl838x_eth_reset(s);

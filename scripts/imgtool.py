@@ -13,6 +13,10 @@ The vendor (Zyxel) firmware is the same header around a gzip'ed Linux 2.6.19
 kernel with its root filesystem inside, which the stock bootloader inflates.
 Where an image is expected, the zip Zyxel distributes it in will do as well.
 
+Teltonika's RutOS for the TSW2xx is an OpenWrt sysupgrade image: a uImage
+with the standard magic around an LZMA kernel (device tree appended, no
+rt-loader), then the squashfs root filesystem, then a signature trailer.
+
     info           dump the uImage header, locate rt-loader and the LZMA blob
     extract-kernel decompress the kernel (for the loader-bypass boot path)
     dtb            extract the appended device tree blob
@@ -35,6 +39,7 @@ RTL_MAGIC = 0x83800000
 HDR_LEN = 64
 
 COMP_GZIP = 1
+COMP_LZMA = 3
 
 # The GS1900-8's flash, as the stock bootloader and both firmwares lay it out.
 FLASH_SIZE = 16 * 1024 * 1024
@@ -43,6 +48,12 @@ FLASH_SYSINFO = 0x50000     # second environment ("u-boot-env2")
 FLASH_ENV_SIZE = 0x10000
 FLASH_FIRMWARE = 0x260000   # first image slot
 FLASH_FIRMWARE2 = 0x930000  # second image slot, where the vendor layout puts it
+
+# The Teltonika TSW2xx's flash: the same chip, laid out differently.
+TSW_UBOOT_ENV = 0x80000     # "u-boot-env"
+TSW_CONFIG = 0x90000        # "config", the manufacturing data
+TSW_FIRMWARE = 0xa0000      # "firmware"
+TSW_FIRMWARE_END = 0xf70000  # "event-log" follows
 
 # Enough of an environment for the vendor firmware to come up: it reads both
 # and dereferences what it did not find.  The values are this project's, not
@@ -59,6 +70,32 @@ DEFAULT_SYSINFO = {
     "bootpartition": "0",
     "bootmsg": "1",
     "resetdefault": "0",
+}
+
+# Realtek's SDK, which RutOS loads as a module, will not start without a
+# hardware profile, and takes its name from the U-Boot environment.  This is
+# the one matching the TSW202: an RTL8380M, its eight internal PHYs and two
+# SFP cages.  "ethaddr" is added from the manufacturing data's MAC, as on a
+# real unit: the machine programs it into the switch the way U-Boot does,
+# and the firmware needs its own address and its bridge's to be the same.
+DEFAULT_TSW_UBOOT_ENV = {
+    "baudrate": "115200",
+    "boardmodel": "RTL8380M_INTPHY_2FIB_1G_DEMO",
+}
+
+# The manufacturing data in "config", at the offsets the device tree's mnfinfo
+# node reads them from.  The product code picks the model: its first six
+# characters select the variant of the SFP ports and the PoE controllers in
+# the device tree, and without a known one the kernel oopses setting up DSA.
+# The MAC is binary, the rest ASCII.  The values are this project's.
+TSW_MNFINFO_FIELDS = {"mac": 0x00, "name": 0x10, "serial": 0x30,
+                      "batch": 0x40, "hwver": 0x50}
+DEFAULT_TSW_MNFINFO = {
+    "mac": "02:E0:4C:83:80:01",
+    "name": "TSW202000000",
+    "serial": "0000000001",
+    "batch": "0001",
+    "hwver": "0001",
 }
 
 # There is no bootloader to install -- the machine does its job -- but the
@@ -90,7 +127,7 @@ class Image:
 
     def lzma_offset(self):
         """Offset of the LZMA-alone stream appended after rt-loader."""
-        if self.comp == COMP_GZIP:
+        if self.comp in (COMP_GZIP, COMP_LZMA):
             return None
         for m in re.finditer(rb"\x5d\x00\x00", self.data):
             off = m.start()
@@ -104,9 +141,16 @@ class Image:
             return off
         return None
 
+    def unlzma(self):
+        """The unpacked payload of a Teltonika image."""
+        return lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(
+            self.payload)
+
     def kernel(self):
         if self.comp == COMP_GZIP:
             return self.gunzip()
+        if self.comp == COMP_LZMA:
+            return self.unlzma()
         off = self.lzma_offset()
         if off is None:
             raise ValueError("no LZMA kernel found in payload")
@@ -125,6 +169,15 @@ class Image:
             raise ValueError("no appended DTB found")
         off, totalsize = best
         return k[off:off + totalsize]
+
+    def is_tsw(self):
+        """Whether this is Teltonika's firmware for the TSW2xx."""
+        if self.comp != COMP_LZMA:
+            return False
+        try:
+            return b"teltonika,tsw2" in self.dtb()
+        except ValueError:
+            return False
 
 
 def fdt_to_dts(dtb):
@@ -185,6 +238,23 @@ def uboot_env(variables):
     return struct.pack(">I", zlib.crc32(body)) + body
 
 
+def mkflash_tsw(data, env, mnfinfo):
+    """The TSW2xx's layout: environment, manufacturing data, firmware."""
+    if len(data) > TSW_FIRMWARE_END - TSW_FIRMWARE:
+        raise ValueError("image does not fit the flash")
+    flash = bytearray(b"\xff" * FLASH_SIZE)
+    flash[TSW_UBOOT_ENV:TSW_UBOOT_ENV + FLASH_ENV_SIZE] = uboot_env(env)
+    for name, value in mnfinfo.items():
+        if name not in TSW_MNFINFO_FIELDS:
+            raise ValueError(f"unknown manufacturing field {name!r}")
+        raw = (bytes.fromhex(value.replace(":", "")) if name == "mac"
+               else value.encode())
+        off = TSW_CONFIG + TSW_MNFINFO_FIELDS[name]
+        flash[off:off + len(raw)] = raw
+    flash[TSW_FIRMWARE:TSW_FIRMWARE + len(data)] = data
+    return bytes(flash)
+
+
 def mkflash(data, bdinfo, sysinfo):
     if len(data) > FLASH_SIZE - FLASH_FIRMWARE:
         raise ValueError("image does not fit the flash")
@@ -207,6 +277,9 @@ def main():
                     help="mkflash: set a variable in the U-Boot environment")
     ap.add_argument("--sysinfo", action="append", default=[], metavar="NAME=VALUE",
                     help="mkflash: set a variable in the second environment")
+    ap.add_argument("--mnfinfo", action="append", default=[], metavar="NAME=VALUE",
+                    help="mkflash, TSW2xx: set a manufacturing field "
+                         "(mac, name, serial, batch, hwver)")
     args = ap.parse_args()
 
     img = load(args.image)
@@ -214,10 +287,18 @@ def main():
     if args.command == "mkflash":
         if not args.output:
             ap.error("mkflash needs -o")
-        bdinfo, sysinfo = dict(DEFAULT_BDINFO), dict(DEFAULT_SYSINFO)
-        for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
-            env.update(v.split("=", 1) for v in given)
-        open(args.output, "wb").write(mkflash(img.data, bdinfo, sysinfo))
+        if img.is_tsw():
+            env, mnfinfo = dict(DEFAULT_TSW_UBOOT_ENV), dict(DEFAULT_TSW_MNFINFO)
+            env.update(v.split("=", 1) for v in args.bdinfo)
+            mnfinfo.update(v.split("=", 1) for v in args.mnfinfo)
+            env.setdefault("ethaddr", mnfinfo["mac"])
+            flash = mkflash_tsw(img.data, env, mnfinfo)
+        else:
+            bdinfo, sysinfo = dict(DEFAULT_BDINFO), dict(DEFAULT_SYSINFO)
+            for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
+                env.update(v.split("=", 1) for v in given)
+            flash = mkflash(img.data, bdinfo, sysinfo)
+        open(args.output, "wb").write(flash)
         print(f"wrote {FLASH_SIZE} bytes to {args.output}", file=sys.stderr)
         return
 
@@ -238,9 +319,10 @@ def main():
                 print(f"appended dtb {len(dtb)} bytes")
             except ValueError as e:
                 print(f"appended dtb: {e}")
-        elif img.comp == COMP_GZIP:
-            k = img.gunzip()
-            print(f"gzip kernel 0x{HDR_LEN:04x}.. -> {len(k)} bytes uncompressed")
+        elif img.comp in (COMP_GZIP, COMP_LZMA):
+            k = img.kernel()
+            print(f"{COMPRESSION[img.comp]} kernel 0x{HDR_LEN:04x}.. -> "
+                  f"{len(k)} bytes uncompressed")
             m = re.search(rb"Linux version [^\n]*", k)
             if m:
                 print(f"            {m.group().decode('ascii', 'replace')}")

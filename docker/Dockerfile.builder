@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-dev \
         libpixman-1-dev \
         zlib1g-dev \
+        liblzma-dev \
         libslirp-dev \
         libcapstone-dev \
     && rm -rf /var/lib/apt/lists/*

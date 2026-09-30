@@ -1,15 +1,23 @@
 /*
  * Realtek Otto GPIO controller (RTL838x variant)
  *
- * 24 lines at 0x18003500.  Nothing is polled here and no line is driven by
- * the board, so plain storage plus write-one-to-clear on the status register
- * is enough to keep gpio-realtek-otto happy.
+ * 24 lines at 0x18003500.  Nothing outside drives a line, but the board may
+ * pull some up, which the pull-ups property says: such a line, configured
+ * as an input, reads 1.  On the TSW2xx that is what makes an empty SFP cage
+ * read as empty, the reset button as released, and a bit-banged I2C bus with
+ * nothing on it see nobody acknowledge, rather than a stuck-low clock that
+ * each transfer waits out.  The GS1900 has none that matter, and Zyxel's
+ * firmware reads its board straps from these lines and does not recognise
+ * the board with them all high.  Every other line reads back what was last
+ * written to it.  Otherwise plain storage plus write-one-to-clear on the
+ * status register is enough to keep gpio-realtek-otto happy.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/mips/rtl838x.h"
 #include "migration/vmstate.h"
@@ -17,7 +25,7 @@
 #define RTL838X_GPIO_SIZE   0x20
 
 #define RTL838X_GPIO_CNR    0x00
-#define RTL838X_GPIO_DIR    0x08
+#define RTL838X_GPIO_DIR    0x08    /* set = output */
 #define RTL838X_GPIO_DATA   0x0c
 #define RTL838X_GPIO_ISR    0x10
 #define RTL838X_GPIO_IMR_AB 0x14
@@ -32,6 +40,7 @@ struct RTL838xGpioState {
     qemu_irq irq;
 
     uint32_t regs[RTL838X_GPIO_SIZE / 4];
+    uint32_t pullups;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(RTL838xGpioState, RTL838X_GPIO)
@@ -40,6 +49,11 @@ static uint64_t rtl838x_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     RTL838xGpioState *s = opaque;
 
+    if (addr == RTL838X_GPIO_DATA) {
+        uint32_t pulled = ~s->regs[RTL838X_GPIO_DIR / 4] & s->pullups;
+
+        return s->regs[addr / 4] | pulled;
+    }
     return s->regs[addr / 4];
 }
 
@@ -94,10 +108,15 @@ static const VMStateDescription vmstate_rtl838x_gpio = {
     }
 };
 
+static const Property rtl838x_gpio_properties[] = {
+    DEFINE_PROP_UINT32("pull-ups", RTL838xGpioState, pullups, 0),
+};
+
 static void rtl838x_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    device_class_set_props(dc, rtl838x_gpio_properties);
     dc->vmsd = &vmstate_rtl838x_gpio;
     device_class_set_legacy_reset(dc, rtl838x_gpio_reset);
 }

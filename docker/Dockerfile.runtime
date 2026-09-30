@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpixman-1-0 \
         libslirp0 \
         libcapstone5 \
+        liblzma5 \
         python3 \
     && rm -rf /var/lib/apt/lists/*
 

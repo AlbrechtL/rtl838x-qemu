@@ -7,6 +7,7 @@ scratch flash first, the way "./rtl838x.sh mkflash" does it, and the machine
 is started without -kernel.  Everything after that goes through the vendor
 CLI on the serial console and through the front-panel ports.  Run it through
 "./rtl838x.sh test-stock <image.bix>", which supplies the container.
+Teltonika's firmware is handed on to test_tsw.py.
 """
 
 import argparse
@@ -83,6 +84,10 @@ def main():
     args = ap.parse_args()
 
     image = imgtool.load(args.image)
+    if image.is_tsw():
+        import test_tsw
+        return test_tsw.run(args)
+
     flash = tempfile.NamedTemporaryFile(prefix="rtl838x-flash-", suffix=".bin")
     flash.write(imgtool.mkflash(image.data, imgtool.DEFAULT_BDINFO,
                                 imgtool.DEFAULT_SYSINFO))

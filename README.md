@@ -4,9 +4,9 @@ Runs OpenWrt for Realtek RTL838x switch SoCs in an emulator. The target is the
 Zyxel GS1900-8 image in `images/`, booted unmodified.
 
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
-[Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/)
-and Zyxel's own firmware for the GS1900-8 all run; see
-[Tested firmware](#tested-firmware) for exactly which.
+[Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
+Zyxel's own firmware for the GS1900-8 and Teltonika's RutOS for the TSW2xx
+all run; see [Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
@@ -39,10 +39,14 @@ no kernel oops or unhandled faults       PASS
 * [Quick start](#quick-start)
 * [Networking](#networking)
 * [Flash](#flash)
-* [Vendor firmware](#vendor-firmware)
+* [Zyxel firmware](#zyxel-firmware)
   * [Why it wants a flash](#why-it-wants-a-flash)
   * [What it took](#what-it-took)
   * [What does not work](#what-does-not-work)
+* [Teltonika firmware](#teltonika-firmware)
+  * [What mkflash writes](#what-mkflash-writes)
+  * [What RutOS needed](#what-rutos-needed)
+  * [What RutOS lacks](#what-rutos-lacks)
 * [How the image boots](#how-the-image-boots)
 * [What is modelled](#what-is-modelled)
 * [How the data path works](#how-the-data-path-works)
@@ -58,11 +62,14 @@ no kernel oops or unhandled faults       PASS
 | OpenWrt snapshot, `openwrt-realtek-rtl838x-zyxel_gs1900-8-a1-initramfs-kernel.bin` (the image in `images/`) | Zyxel GS1900-8 (A1) | RTL8380M | In the emulator, by `./rtl838x.sh test` |
 | [Ethernet Switch OS](https://albrechtl.github.io/ethernet-switch-os/) | Zyxel GS1900-8 | RTL8380M | In the emulator, and the same image on a real GS1900-8 |
 | Ethernet Switch OS | an RTL8382MI board | RTL8382MI | In the emulator |
-| Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Vendor firmware](#vendor-firmware) |
+| Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Zyxel firmware](#zyxel-firmware) |
+| Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash. Images for other RTL838x
-boards may work as well, as long as their device tree asks for nothing more.
+boards may work as well, as long as their device tree asks for nothing more;
+the TSW2xx's two SFP cages are there only as far as its device tree says so,
+and are empty.
 
 ## Quick start
 
@@ -79,7 +86,8 @@ git submodule update --init      # QEMU, pinned at v11.1.1
 Other commands: `run-log` (adds `-d unimp,guest_errors` into `out/qemu.log`),
 `shell` (a shell in the build container), `info` and `dts` (inspect the
 firmware image), `mkflash`, `run-flash` and `test-stock` (for the
-[vendor firmware](#vendor-firmware)), `clean`, `distclean`, `help`.
+[Zyxel](#zyxel-firmware) and [Teltonika](#teltonika-firmware) firmware),
+`clean`, `distclean`, `help`.
 
 `run`, `run-log`, `test`, `info` and `dts` take the image as their first
 argument, defaulting to the one in `images/`. QEMU options all start with a
@@ -156,11 +164,12 @@ tr '\000' '\377' < /dev/zero | head -c 16M > flash.bin
 
 With a flash and no `-kernel`, the machine does what the stock bootloader does
 with `bootpartition=0`: it loads the uImage at `0x260000`, the start of the
-first image slot, and starts it. It does so on every reset, so after an
-upgrade the reboot starts the new firmware. With `-kernel`, the kernel is
-booted instead, on every reset too, and the flash is just there to be
-installed to -- the way a TFTP-booted initramfs installs a firmware on the real
-switch:
+first image slot, and starts it -- or, with nothing there, the one at
+`0xa0000`, where the TSW2xx keeps its firmware. It does so on every reset, so
+after an upgrade the reboot starts the new firmware. With `-kernel`, the
+kernel is booted instead, on every reset too, and the flash is just there to
+be installed to -- the way a TFTP-booted initramfs installs a firmware on the
+real switch:
 
 ```sh
 qemu-system-mips -M rtl838x -m 128 -nographic -no-reboot \
@@ -170,6 +179,12 @@ qemu-system-mips -M rtl838x -m 128 -nographic \
     -drive if=mtd,format=raw,file=flash.bin
 ```
 
+The bootloader also programs the switch's MAC address registers with
+`ethaddr` from its environment, and the firmware takes its address from there.
+The machine does the same when the flash holds an environment with one, at
+`0x40000` as on the GS1900 or `0x80000` as on the TSW2xx; otherwise the address
+is a random one, fixed for the life of the QEMU process.
+
 `-drive if=mtd,...,snapshot=on` keeps every write in a temporary file instead,
 so the flash file is left as it was when QEMU exits, while a reboot inside
 QEMU still sees the writes.
@@ -177,9 +192,9 @@ QEMU still sees the writes.
 Which chip the flash identifies as is the machine's `flash-model` property,
 any 16 MiB part QEMU's `m25p80` models: `-machine flash-model=mx25l12805d`
 gives the JEDEC ID of the chip that is actually soldered to the board, which
-is the only one the vendor firmware accepts.
+is the only one the Zyxel firmware accepts.
 
-## Vendor firmware
+## Zyxel firmware
 
 Zyxel's firmware for the GS1900-8 boots to its CLI and its web interface, and
 switches. It is a different animal from OpenWrt -- Linux 2.6.19, no device
@@ -259,7 +274,7 @@ does not get far without a flash it recognises with the right things in it.
 | Offset | Partition | Content |
 |---|---|---|
 | `0x000000` | `LOADER` | Erased, but for a placeholder U-Boot version string. There is no bootloader to install, the machine does its job, yet `show version` searches this partition for the string and fails without one. It reads the placeholder as `V0.0.0.0`. |
-| `0x040000` | `BDINFO` | A U-Boot environment. `--bdinfo name=value` adds to it. |
+| `0x040000` | `BDINFO` | A U-Boot environment. `--bdinfo name=value` adds to it. Its `ethaddr`, `02:E0:4C:83:80:01` unless changed, is what the machine programs into the switch and the firmware reports as its MAC address. |
 | `0x050000` | `SYSINFO` | A second environment, the firmware's own: `bootpartition`, `bootmsg`, `resetdefault`. `--sysinfo name=value` adds to it. The board module reads it while loading and dereferences a null pointer if the flash did not probe. |
 | `0x060000` | `JFFS2 CFG`, `JFFS2 LOG` | Erased. The firmware formats them on first boot and keeps its configuration, keys and log there. |
 | `0x260000` | `RUNTIME` | The `.bix`, byte for byte. |
@@ -311,8 +326,6 @@ None of it changed what OpenWrt sees: `./rtl838x.sh test` passes as before.
   The firmware reads the hardware's L2 table, and this machine keeps what it
   learns in a table of its own; see [Known gaps](#known-gaps). Forwarding is
   not affected.
-* The firmware makes up its MAC address from the one the machine programs into
-  the switch, which is random per QEMU process, and ignores `ethaddr`.
 * Port counters read zero, as they do under OpenWrt.
 * The second UART is only there with a second `-serial`; the firmware pokes it
   regardless, which is the only `-d unimp` output a boot produces. The only
@@ -321,6 +334,146 @@ None of it changed what OpenWrt sees: `./rtl838x.sh test` passes as before.
 * Untested: firmware upgrade from the CLI or the web interface, the second
   image slot, SSH, SNMP, anything involving LAGs, ACLs, IGMP snooping, PoE or
   more than one VLAN, and a reboot from inside the firmware.
+
+## Teltonika firmware
+
+Teltonika's TSW2xx switches are the same RTL8380M with the same eight copper
+ports, plus two SFP cages. Their firmware, RutOS, is OpenWrt underneath --
+Linux 5.10, an OpenWrt DSA driver from before 2023 -- with Realtek's SDK
+loaded on top of it as kernel modules. So it drives the hardware two ways at
+once, and has opinions about both.
+
+The firmware is not in this repository. Tested is TSW2_R_00.01.10.2, from
+<https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin>,
+the sysupgrade image as it is. The machine is set up as a TSW202; its ports
+are `port1`..`port8`, which are the `-nic`s in order as `lan1`..`lan8` are
+under OpenWrt, and `sfp1` and `sfp2`, whose cages are empty.
+
+```sh
+./rtl838x.sh mkflash images/TSW2_R_00.01.10.2_WEBUI.bin tsw.bin
+./rtl838x.sh run-flash tsw.bin
+```
+
+The console is there about ten seconds later; the network takes half a
+minute more:
+
+```
+  Hardware-profile probe
+ (RTL8380M_INTPHY_2FIB_1G_DEMO)
+...
+Please press Enter to activate this console.
+
+TSW202 login: root
+Password: *******
+root@TSW202:~# cat /etc/version
+TSW2_R_00.01.10.2
+root@TSW202:~# ip -br addr show dev br0.1
+br0.1@br0        UP             192.168.1.2/24 10.0.2.15/24 ...
+```
+
+The login is `root`, password `admin01`: a real unit's password is
+printed on its label and stored, hashed, in its manufacturing data, and RutOS
+falls back to `admin01` when there is none. The switch's own address is
+192.168.1.2, and it also runs a DHCP client on the same bridge, so QEMU's user
+network leases it 10.0.2.15 and needs no renumbering: the web interface is on
+<http://localhost:8080> and <https://localhost:8443> once the lease is in.
+
+```sh
+./rtl838x.sh run-flash tsw.bin \
+    -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443
+```
+
+`test-stock` recognises the image and runs `tests/test_tsw.py`:
+
+```
+$ ./rtl838x.sh test-stock images/TSW2_R_00.01.10.2_WEBUI.bin
+the SDK finds its hardware profile       PASS
+reaches the console                      PASS
+logs in with the fallback password       PASS
+the firmware names its version           PASS
+it takes itself for a TSW202             PASS
+port1..port8, sfp1, sfp2 exist           PASS
+the three cabled ports are up            PASS
+the empty ports and cages are not        PASS
+ports negotiated 1 Gbps                  PASS
+gets a lease from the host on port3      PASS
+the switch pings the host                PASS
+the switch answers an arp for its address PASS
+port1 to port2 is switched in hardware   PASS
+a frame is not reflected to its source   PASS
+the web interface answers                PASS
+the overlay is JFFS2 on flash            PASS
+no kernel oops or unhandled faults       PASS
+```
+
+### What mkflash writes
+
+The TSW2xx lays its flash out differently from the GS1900, and `mkflash`
+tells the two firmwares apart by the device tree inside the image:
+
+| Offset | Partition | Content |
+|---|---|---|
+| `0x000000` | `u-boot` | Erased. |
+| `0x080000` | `u-boot-env` | A U-Boot environment: `boardmodel=RTL8380M_INTPHY_2FIB_1G_DEMO`, the Realtek SDK's name for an RTL8380M with its internal PHYs and two fibre ports, without which the SDK module oopses; and `ethaddr`, the manufacturing MAC. `--bdinfo name=value` adds to it. |
+| `0x090000` | `config` | Manufacturing data: MAC (binary), product code `TSW202000000`, serial, batch, hardware version. `--mnfinfo name=value` changes a field. The product code picks among the device tree's per-model variants of the SFP ports and PoE controllers; without one the kernel oopses setting up DSA. |
+| `0x0a0000` | `firmware` | The image, byte for byte: kernel, squashfs, and the signature trailer. The first boot formats the JFFS2 overlay behind the root filesystem. |
+| `0xf70000` | `event-log` | Erased. |
+
+The values are this project's, not a dump of a real unit; the MAC is
+`02:e0:4c:83:80:01`, and the ports count up from it.
+
+### What RutOS needed
+
+* **An LZMA uImage.** The kernel is a plain uImage around an LZMA kernel, no
+  rt-loader; the machine unpacks it as U-Boot's `bootm` would, with liblzma.
+* **The firmware slot at `0xa0000`**, which the machine looks at when the
+  GS1900's is empty.
+* **A fourth busy bit.** DSA setup drives an indirect access engine at
+  `0xe3e0` that upstream never uses, and spins on bit 15 of `0xe3e4`.
+* **DMA addresses are 29 bits.** The driver gives the CPU-port DMA engine
+  KSEG1 addresses, `0xa4000000` for `0x04000000`. The top bits are not wired,
+  and taken literally they pointed at nothing: not a frame crossed the CPU
+  port, and after 160 transmits the ring was full.
+* **"Received" is not "ran out".** The RX status word has one of each per
+  ring. The model raised both for every frame, which current OpenWrt folds
+  together and does not mind; this driver answers "ran out" by tearing the
+  ring down and dropping what is in it.
+* **Every row of the multicast port mask table floods everywhere out of
+  reset.** The SDK points broadcast flooding at row 504, having shifted the
+  row number to where the RTL839x keeps it -- OpenWrt did the same until
+  [1b7fd84](https://github.com/openwrt/openwrt/commit/1b7fd8464c2b170d0862e0c19fff11fd8dc50611).
+  It works on the switch because nothing ever writes row 504.
+* **The switch's own address comes from the bootloader.** Hardware learning
+  is off on the CPU port, and the SDK's unknown-unicast flood row leaves the
+  CPU out, so a frame for the switch only arrives through the static L2 entry
+  the driver installs for its conduit's address -- which it read from the MAC
+  registers U-Boot filled in with `ethaddr`, and which the bridge uses too.
+  Hence the machine taking `ethaddr` from the flash, and the forwarding engine
+  consulting static entries (see [Known gaps](#known-gaps)).
+* **The board pulls its GPIO lines up.** Inputs read back as 0 before, so
+  each bit-banged I2C bus sat through a stuck-low clock on every transfer
+  while probing its PoE controllers, TPM and SFP modules -- 80 seconds to the
+  console instead of 10 -- and both cages and the reset button read as
+  occupied and pressed. It is a property of the board, not the SoC: Zyxel's
+  firmware reads board straps from the same lines and does not recognise a
+  GS1900 with them all high. So the machine pulls them up only when the
+  firmware sits where a TSW2xx keeps it.
+
+None of it changed what OpenWrt or the Zyxel firmware see: both test suites
+pass as before.
+
+### What RutOS lacks
+
+* PoE: the three PoE controllers on the bit-banged I2C bus are not there, and
+  the kernel says so (`failed to start POE chip`). Neither are the TPM or
+  anything else on those buses, and the SFP cages are always empty.
+* Port counters read zero, as they do under OpenWrt: there are no MIB
+  counters.
+* The `u-boot` partition is empty, so the kernel cannot read a bootloader
+  version from it, and says so.
+* Untested: firmware upgrade (which checks the image's signature), SSH,
+  anything beyond the default VLAN, the web interface past its login page,
+  and a reboot from inside the firmware.
 
 ## How the image boots
 
@@ -337,8 +490,9 @@ The machine parses that header, copies the payload to `0x80100000` and starts
 executing, so `rt-loader` runs exactly as it does on the real switch. From
 flash it does the same with the uImage at `0x260000`, see [Flash](#flash). ELF
 `vmlinux` files and raw kernels are also accepted, and so is a uImage whose
-payload is gzip'ed, which is inflated to its load address first: that is what
-the [vendor firmware](#vendor-firmware) is.
+payload is gzip'ed or LZMA-compressed, which is unpacked to its load address
+first: that is what the [Zyxel](#zyxel-firmware) and the
+[Teltonika](#teltonika-firmware) firmware are.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
 the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
@@ -357,7 +511,7 @@ time by `scripts/sync.sh`.
 | SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash) |
 | UART | `0x18002000` | 16550, reg-shift 2 |
 | Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
-| GPIO | `0x18003500` | 24 lines |
+| GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx |
 | Switch core | `0x1b000000` | SoC ID, PLLs, thermal, table engine, MDIO, 8 PHYs |
 | CPU-port DMA | `0x1b009f00` | Two rings each way, 32-byte descriptors, 20-byte CPU tag |
 | Forwarding | `0x1b000000` | FDB, VLANs, spanning tree, isolation, flooding, RMA traps |
@@ -428,9 +582,11 @@ guest sees through the PHY is the backend's.
 
 ## Known gaps
 
-* Statically programmed FDB entries are not consulted. The driver writes them
-  into the hardware L2 table, which this machine stores but does not read back
-  for forwarding; only learned addresses are. The `failed to add … to fdb:
+* Statically programmed FDB entries count for little. The driver writes them
+  into the hardware L2 table, which this machine stores, but forwards from
+  what it has learned; a static unicast entry is found only for an address
+  nothing has been learned for, by a scan, whatever VLAN it was installed in.
+  Static multicast entries are not consulted. The `failed to add … to fdb:
   -524` message during boot is the driver's own, and unrelated.
 * Only spanning tree instance 0 is modelled, which covers STP and RSTP but not
   MSTP: every VLAN follows the common instance.
@@ -444,8 +600,9 @@ guest sees through the PHY is the backend's.
 * The RTL8231 GPIO expander on the bit-banged MDIO bus is absent, so the reset
   button and the system LED do not exist.
 * The flash has no memory-mapped window, which only the stock bootloader
-  reads through, and the machine loads only the first image slot at
-  `0x260000`; `bootpartition` in the U-Boot environment is not consulted.
+  reads through, and the machine loads only the first image slot, at
+  `0x260000` or `0xa0000`; `bootpartition` in the U-Boot environment is not
+  consulted.
 * Migration saves the register window, the PHYs and the ring cursors, but not
   the table engine's contents or the forwarding database, so a restored machine
   forgets what it had learned.
@@ -464,8 +621,10 @@ docker/             build container and slim runtime container
 tests/test_boot.py  boots the image and checks it over the serial console,
                     including the data path, by plugging a socket netdev into
                     lan1 and lan2 and speaking Ethernet at them
-tests/test_stock.py the same for the vendor firmware, from a scratch flash and
+tests/test_stock.py the same for the Zyxel firmware, from a scratch flash and
                     through the vendor CLI
+tests/test_tsw.py   the same for the Teltonika firmware, which test_stock.py
+                    hands it
 qemu/               submodule, pinned to v11.1.1
 ```
 

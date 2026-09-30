@@ -67,8 +67,19 @@
 
 /* Interrupt status: receive ran out in [7:0], received in [15:8], one bit a
  * ring; then transmitted and "everything queued was transmitted" per ring. */
+#define ETH_INTR_RX_RUNOUT(r)   (1u << (r))
+#define ETH_INTR_RX_DONE(r)     (1u << (8 + (r)))
 #define ETH_INTR_TX_DONE(r)     (1u << (16 + (r)))
 #define ETH_INTR_TX_ALL_DONE(r) (1u << (18 + (r)))
+
+/*
+ * Every address the engine is given -- ring bases, ring entries, buffer
+ * pointers -- is on a 29-bit bus.  Upstream OpenWrt and the vendor SDK hand
+ * it physical addresses, but Teltonika's kernel hands it the uncached KSEG1
+ * alias (0xa4000000 for 0x04000000), and the top three bits are simply not
+ * wired.
+ */
+#define ETH_DMA_ADDR_MASK       0x1fffffffu
 
 /* Ring entry. */
 #define RING_OWN_HW             (1u << 0)
@@ -109,27 +120,32 @@
         }                                                           \
     } while (0)
 
+static hwaddr eth_bus(hwaddr addr)
+{
+    return addr & ETH_DMA_ADDR_MASK;
+}
+
 static uint32_t eth_ldl(hwaddr addr)
 {
-    return address_space_ldl_be(&address_space_memory, addr,
+    return address_space_ldl_be(&address_space_memory, eth_bus(addr),
                                 MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 static uint16_t eth_lduw(hwaddr addr)
 {
-    return address_space_lduw_be(&address_space_memory, addr,
+    return address_space_lduw_be(&address_space_memory, eth_bus(addr),
                                  MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 static void eth_stl(hwaddr addr, uint32_t val)
 {
-    address_space_stl_be(&address_space_memory, addr, val,
+    address_space_stl_be(&address_space_memory, eth_bus(addr), val,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
 static void eth_stw(hwaddr addr, uint16_t val)
 {
-    address_space_stw_be(&address_space_memory, addr, val,
+    address_space_stw_be(&address_space_memory, eth_bus(addr), val,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
@@ -199,8 +215,8 @@ static bool rtl838x_eth_tx_frame(RTL838xSwitchState *s, unsigned ring,
 
         if (len + flen <= ETH_FRAME_MAX) {
             dma_memory_read(&address_space_memory,
-                            eth_ldl(frag + FRAG_DMA), frame + len, flen,
-                            MEMTXATTRS_UNSPECIFIED);
+                            eth_bus(eth_ldl(frag + FRAG_DMA)), frame + len,
+                            flen, MEMTXATTRS_UNSPECIFIED);
             len += flen;
         } else {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -301,6 +317,8 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
         if (!(entry & RING_OWN_HW) || frags++ >= ETH_MAX_FRAGS) {
             eth_dbg("rx ring %u: out of buffers, dropping %zu bytes\n",
                     ring, len);
+            s->regs[ETH_DMA_IF_INTR_STS / 4] |= ETH_INTR_RX_RUNOUT(ring);
+            rtl838x_eth_update_irq(s);
             return;
         }
 
@@ -315,7 +333,7 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
     for (done = 0; done < total; ) {
         uint32_t entry = eth_ldl(base + s->rx_cursor[ring] * 4);
         hwaddr frag = entry & RING_ADDR_MASK;
-        hwaddr dma = eth_ldl(frag + FRAG_DMA);
+        hwaddr dma = eth_bus(eth_ldl(frag + FRAG_DMA));
         size_t chunk = MIN(eth_lduw(frag + FRAG_SIZE), total - done);
         bool last;
 
@@ -371,12 +389,14 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
             ring, len, src_port, reason);
 
     /*
-     * The driver's handler folds the "ring has work" and "ring ran out of
-     * buffers" halves of the status word together, and unmasks both, so raise
-     * both bits.  The interrupt is a level: it stays up until the status is
-     * cleared or the mask is taken away.
+     * "Received", and nothing else: "ran out of buffers" is raised above,
+     * when a frame is dropped for want of them.  Current OpenWrt folds the
+     * two together, but Teltonika's driver answers a run-out by tearing the
+     * ring down and setting it up again, losing whatever was in it.  The
+     * interrupt is a level: it stays up until the status is cleared or the
+     * mask is taken away.
      */
-    s->regs[ETH_DMA_IF_INTR_STS / 4] |= (1u << ring) | (1u << (ring + 8));
+    s->regs[ETH_DMA_IF_INTR_STS / 4] |= ETH_INTR_RX_DONE(ring);
     rtl838x_eth_update_irq(s);
 }
 

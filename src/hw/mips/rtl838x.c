@@ -6,7 +6,9 @@
  * the machine either loads the kernel image given with -kernel, or does what
  * the stock bootloader does, and loads the uImage from the flash's first
  * image slot -- on every reset, so that a reboot after a firmware update
- * starts the new firmware.
+ * starts the new firmware.  Teltonika's TSW2xx, the same SoC with the same
+ * eight ports, keeps its firmware elsewhere in the flash; that is looked at
+ * when the GS1900's slot is empty.
  *
  * The OpenWrt kernel carries its device tree appended to itself
  * (CONFIG_MIPS_RAW_APPENDED_DTB=y), so this board never builds or passes a
@@ -46,6 +48,9 @@
 #include "elf.h"
 #include "cpu.h"
 
+#include <lzma.h>
+#include <zlib.h>
+
 /*
  * Legacy U-Boot image header.  OpenWrt's realtek images replace the magic
  * with a vendor value the stock bootloader looks for -- the device tree spells
@@ -54,15 +59,25 @@
  * LZMA-compressed kernel appended, which relocates itself, decompresses and
  * jumps.  Running that as-is is the point, so that the shipped image boots
  * unmodified.  The vendor's images use the same magic around a gzip'ed
- * kernel, which the bootloader, and so this machine, inflates.
+ * kernel, which the bootloader, and so this machine, inflates.  Teltonika's
+ * RutOS images are a plain uImage around an LZMA kernel, with no rt-loader,
+ * and get the same treatment.
  */
 #define UIMAGE_MAGIC        0x27051956
 #define UIMAGE_MAGIC_RTL    0x83800000
 #define UIMAGE_HEADER_SIZE  64
 #define UIMAGE_COMP_NONE    0
 #define UIMAGE_COMP_GZIP    1
-/* Room to unpack a gzip payload into; the vendor kernel is under 8 MiB. */
+#define UIMAGE_COMP_LZMA    3
+/* Room to unpack a payload into; the kernels here are all under 8 MiB. */
 #define UIMAGE_UNPACK_MAX   (32 * MiB)
+
+/*
+ * Where the stock bootloaders keep their environment: the GS1900's at
+ * 0x40000, the TSW2xx's at 0x80000.  64 KiB each, a CRC32 of the rest first.
+ */
+#define UBOOT_ENV_SIZE      0x10000
+static const uint32_t uboot_env_offsets[] = { 0x40000, 0x80000 };
 
 struct RTL838xMachineState {
     MachineState parent_obj;
@@ -127,6 +142,41 @@ static uint32_t be32_at(const uint8_t *p)
 }
 
 /*
+ * What the bootloader does with "ethaddr": it programs the switch's MAC
+ * address registers with it, and the firmware takes its own address from
+ * there.  Teltonika's relies on that address being the device's, which its
+ * bridge also uses: the driver installs the one it found as the static L2
+ * entry that brings frames for the switch itself to the CPU.  Returns false
+ * if the flash holds no environment with a usable ethaddr.
+ */
+static bool rtl838x_flash_ethaddr(BlockBackend *blk, MACAddr *mac)
+{
+    g_autofree uint8_t *env = g_malloc(UBOOT_ENV_SIZE + 1);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(uboot_env_offsets); i++) {
+        const char *var;
+
+        if (blk_pread(blk, uboot_env_offsets[i], UBOOT_ENV_SIZE, env, 0) < 0 ||
+            be32_at(env) != crc32(0, env + 4, UBOOT_ENV_SIZE - 4)) {
+            continue;
+        }
+        env[UBOOT_ENV_SIZE] = 0;
+        for (var = (char *)env + 4; *var; var += strlen(var) + 1) {
+            unsigned a[6];
+
+            if (sscanf(var, "ethaddr=%x:%x:%x:%x:%x:%x", &a[0], &a[1],
+                       &a[2], &a[3], &a[4], &a[5]) == 6) {
+                for (unsigned b = 0; b < 6; b++) {
+                    mac->a[b] = a[b];
+                }
+                return !(mac->a[0] & 1);
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * Checks a legacy uImage header against the size of what it came from.
  * Returns the payload size, or 0 with errp set.
  */
@@ -140,9 +190,10 @@ static uint32_t rtl838x_check_uimage(const uint8_t *hdr, uint64_t len,
                    what, payload);
         return 0;
     }
-    if (hdr[31] != UIMAGE_COMP_NONE && hdr[31] != UIMAGE_COMP_GZIP) {
+    if (hdr[31] != UIMAGE_COMP_NONE && hdr[31] != UIMAGE_COMP_GZIP &&
+        hdr[31] != UIMAGE_COMP_LZMA) {
         error_setg(errp, "uImage in %s has a compressed payload (type %u); "
-                   "only uncompressed and gzip payloads are supported",
+                   "only uncompressed, gzip and lzma payloads are supported",
                    what, hdr[31]);
         return 0;
     }
@@ -150,10 +201,33 @@ static uint32_t rtl838x_check_uimage(const uint8_t *hdr, uint64_t len,
 }
 
 /*
+ * An LZMA payload, as U-Boot's bootm takes it: the 13-byte header of the
+ * "alone" format, then the stream.  Returns the unpacked size, or -1.
+ */
+static ssize_t rtl838x_unlzma(uint8_t *out, size_t out_size,
+                              const uint8_t *in, size_t in_size)
+{
+    lzma_stream strm = LZMA_STREAM_INIT;
+    lzma_ret ret;
+
+    if (lzma_alone_decoder(&strm, UINT64_MAX) != LZMA_OK) {
+        return -1;
+    }
+    strm.next_in = in;
+    strm.avail_in = in_size;
+    strm.next_out = out;
+    strm.avail_out = out_size;
+    ret = lzma_code(&strm, LZMA_FINISH);
+    lzma_end(&strm);
+    return ret == LZMA_STREAM_END ? (ssize_t)strm.total_out : -1;
+}
+
+/*
  * What the bootloader's bootm does with the payload before jumping to it.
  * OpenWrt's is the uncompressed rt-loader and is used as it is; the vendor
- * firmware's is a gzip'ed kernel, which the bootloader inflates to the load
- * address.  Returns the bytes to place there, which the caller frees.
+ * firmware's is a gzip'ed kernel and Teltonika's an LZMA one, which the
+ * bootloader unpacks to the load address.  Returns the bytes to place
+ * there, which the caller frees.
  */
 static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload,
                                       uint32_t *size, const char *what,
@@ -167,9 +241,13 @@ static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload
     }
 
     out = g_malloc(UIMAGE_UNPACK_MAX);
-    len = gunzip(out, UIMAGE_UNPACK_MAX, (uint8_t *)payload, *size);
+    if (hdr[31] == UIMAGE_COMP_LZMA) {
+        len = rtl838x_unlzma(out, UIMAGE_UNPACK_MAX, payload, *size);
+    } else {
+        len = gunzip(out, UIMAGE_UNPACK_MAX, (uint8_t *)payload, *size);
+    }
     if (len < 0) {
-        error_setg(errp, "could not gunzip the uImage in %s", what);
+        error_setg(errp, "could not unpack the uImage in %s", what);
         return NULL;
     }
     *size = len;
@@ -178,34 +256,56 @@ static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload
 
 /*
  * The stock bootloader's part: the uImage at the start of the flash's first
- * image slot, copied to its load address.  Reads the flash through the
- * block layer, so a firmware update the guest wrote is what the next reset
- * boots.  Returns the entry point.
+ * image slot, copied to its load address.  The GS1900's slot is tried
+ * first, then the TSW2xx's.  Reads the flash through the block layer, so a
+ * firmware update the guest wrote is what the next reset boots.  Returns
+ * the entry point.
  */
+/*
+ * Where in the flash the firmware is: the GS1900's first image slot, else
+ * the TSW2xx's, with its uImage header in hdr.  0 if neither holds one.
+ */
+static uint32_t rtl838x_flash_slot(BlockBackend *blk,
+                                   uint8_t hdr[UIMAGE_HEADER_SIZE])
+{
+    static const uint32_t slots[] = {
+        RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(slots); i++) {
+        uint32_t magic;
+
+        if (blk_pread(blk, slots[i], UIMAGE_HEADER_SIZE, hdr, 0) < 0) {
+            continue;
+        }
+        magic = be32_at(hdr);
+        if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL) {
+            return slots[i];
+        }
+    }
+    return 0;
+}
+
 static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 {
-    const uint64_t len = RTL838X_FLASH_SIZE - RTL838X_FLASH_FIRMWARE;
     uint8_t hdr[UIMAGE_HEADER_SIZE];
     g_autofree uint8_t *payload = NULL;
     g_autofree uint8_t *image = NULL;
-    uint32_t magic, size;
+    uint32_t size, slot;
     uint64_t load, ep;
 
     /* Writes the flash model has started but not finished. */
     blk_drain(blk);
 
-    if (blk_pread(blk, RTL838X_FLASH_FIRMWARE, sizeof(hdr), hdr, 0) < 0) {
-        error_setg(errp, "could not read the flash");
+    slot = rtl838x_flash_slot(blk, hdr);
+    if (!slot) {
+        error_setg(errp, "no uImage in flash at 0x%x or 0x%x: nothing to "
+                   "boot; install a firmware first, or boot one with -kernel",
+                   RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW);
         return 0;
     }
-    magic = be32_at(hdr);
-    if (magic != UIMAGE_MAGIC && magic != UIMAGE_MAGIC_RTL) {
-        error_setg(errp, "no uImage in flash at 0x%x (magic 0x%08x): "
-                   "nothing to boot; install a firmware first, or boot "
-                   "one with -kernel", RTL838X_FLASH_FIRMWARE, magic);
-        return 0;
-    }
-    size = rtl838x_check_uimage(hdr, len, "flash", errp);
+    size = rtl838x_check_uimage(hdr, RTL838X_FLASH_SIZE - slot, "flash",
+                                errp);
     if (!size) {
         return 0;
     }
@@ -213,8 +313,7 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
     ep = be32_at(hdr + 20);
 
     payload = g_malloc(size);
-    if (blk_pread(blk, RTL838X_FLASH_FIRMWARE + UIMAGE_HEADER_SIZE, size,
-                  payload, 0) < 0) {
+    if (blk_pread(blk, slot + UIMAGE_HEADER_SIZE, size, payload, 0) < 0) {
         error_setg(errp, "could not read the flash");
         return 0;
     }
@@ -380,6 +479,19 @@ static void rtl838x_init(MachineState *machine)
                        qdev_get_gpio_in(intc, RTL838X_IRQ_WDT_PHASE2));
 
     dev = qdev_new(TYPE_RTL838X_GPIO);
+    /*
+     * The board's pull-ups.  A flash with the firmware where the TSW2xx
+     * keeps it is taken for one, and that board pulls its GPIO lines up; see
+     * rtl838x_gpio.c.  The GS1900 is left as it was.
+     */
+    if (flash_dinfo) {
+        uint8_t hdr[UIMAGE_HEADER_SIZE];
+
+        if (rtl838x_flash_slot(blk_by_legacy_dinfo(flash_dinfo), hdr) ==
+            RTL838X_FLASH_FIRMWARE_TSW) {
+            qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_TSW_PULLUPS);
+        }
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_GPIO_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -394,14 +506,18 @@ static void rtl838x_init(MachineState *machine)
     dev = qdev_new(TYPE_RTL838X_SWITCH);
     /*
      * The switch's MAC address.  The real switch has its own in the U-Boot
-     * environment; here it is a random, locally administered one, so that
-     * switches started side by side differ, but it is fixed for the life of
-     * the QEMU process, so that a reboot does not change it.
+     * environment, and so does a flash image that carries one.  Otherwise
+     * it is a random, locally administered one, so that switches started
+     * side by side differ, but it is fixed for the life of the QEMU process,
+     * so that a reboot does not change it.
      */
-    for (unsigned i = 0; i < 6; i++) {
-        mac.a[i] = g_random_int_range(0, 256);
+    if (!flash_dinfo ||
+        !rtl838x_flash_ethaddr(blk_by_legacy_dinfo(flash_dinfo), &mac)) {
+        for (unsigned i = 0; i < 6; i++) {
+            mac.a[i] = g_random_int_range(0, 256);
+        }
+        mac.a[0] = (mac.a[0] & 0xfc) | 0x02;
     }
-    mac.a[0] = (mac.a[0] & 0xfc) | 0x02;
     qdev_prop_set_macaddr(dev, "macaddr", mac.a);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_SW_BASE);

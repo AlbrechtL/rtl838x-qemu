@@ -44,14 +44,15 @@
 
 /*
  * The SPI-NOR flash: its default model, which the machine's flash-model
- * property overrides, and where in it the stock bootloader looks
- * for the uImage it boots.  0x260000 is the GS1900's first image slot, the
- * one "bootpartition=0" selects and the device tree's "firmware" partition
- * starts at.
+ * property overrides, and where in it the stock bootloaders look for the
+ * uImage they boot.  0x260000 is the GS1900's first image slot, the one
+ * "bootpartition=0" selects and the device tree's "firmware" partition
+ * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts.
  */
 #define RTL838X_FLASH_TYPE      "mx25l12855e"
 #define RTL838X_FLASH_SIZE      (16 * 1024 * 1024)
 #define RTL838X_FLASH_FIRMWARE  0x260000
+#define RTL838X_FLASH_FIRMWARE_TSW 0x0a0000
 
 /* SoC interrupt numbers, as used by the device tree. */
 #define RTL838X_IRQ_TIMER4      15
@@ -102,6 +103,8 @@ struct RTL838xIntcState {
 
 /* GPIO controller. */
 #define TYPE_RTL838X_GPIO "rtl838x-gpio"
+/* Every line: the TSW2xx's I2C buses, SFP cage signals and reset button. */
+#define RTL838X_GPIO_TSW_PULLUPS 0xffffffffu
 
 /* Watchdog. */
 #define TYPE_RTL838X_WDT "rtl838x-wdt"
