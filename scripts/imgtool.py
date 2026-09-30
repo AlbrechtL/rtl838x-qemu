@@ -9,21 +9,63 @@ itself but OpenWrt's "rt-loader", with the LZMA-compressed kernel appended to
 it.  The kernel in turn carries its device tree appended at the end
 (CONFIG_MIPS_RAW_APPENDED_DTB=y).
 
+The vendor (Zyxel) firmware is the same header around a gzip'ed Linux 2.6.19
+kernel with its root filesystem inside, which the stock bootloader inflates.
+Where an image is expected, the zip Zyxel distributes it in will do as well.
+
     info           dump the uImage header, locate rt-loader and the LZMA blob
     extract-kernel decompress the kernel (for the loader-bypass boot path)
     dtb            extract the appended device tree blob
     dts            pretty-print the appended device tree
+    mkflash        build a 16 MiB flash image with the firmware installed and
+                   the two U-Boot environments the vendor firmware reads
 """
 
 import argparse
 import lzma
 import re
 import struct
+import io
 import sys
+import zipfile
+import zlib
 
 UIMAGE_MAGIC = 0x27051956
 RTL_MAGIC = 0x83800000
 HDR_LEN = 64
+
+COMP_GZIP = 1
+
+# The GS1900-8's flash, as the stock bootloader and both firmwares lay it out.
+FLASH_SIZE = 16 * 1024 * 1024
+FLASH_BDINFO = 0x40000      # U-Boot environment ("u-boot-env")
+FLASH_SYSINFO = 0x50000     # second environment ("u-boot-env2")
+FLASH_ENV_SIZE = 0x10000
+FLASH_FIRMWARE = 0x260000   # first image slot
+FLASH_FIRMWARE2 = 0x930000  # second image slot, where the vendor layout puts it
+
+# Enough of an environment for the vendor firmware to come up: it reads both
+# and dereferences what it did not find.  The values are this project's, not
+# a dump of a real switch.
+DEFAULT_BDINFO = {
+    "bootcmd": "boota",
+    "bootdelay": "1",
+    "baudrate": "115200",
+    "ethaddr": "02:E0:4C:83:80:01",
+    "ipaddr": "192.168.1.1",
+    "serverip": "192.168.1.111",
+}
+DEFAULT_SYSINFO = {
+    "bootpartition": "0",
+    "bootmsg": "1",
+    "resetdefault": "0",
+}
+
+# There is no bootloader to install -- the machine does its job -- but the
+# vendor firmware looks through the LOADER partition for U-Boot's version
+# string and fails "show version" without one.  It reads this placeholder as
+# version 0.0.0, built on the date in the brackets.
+LOADER_STUB = b"U-Boot 0.0-svn0 (Jan 01 2000 - 00:00:00)\0"
 
 COMPRESSION = {0: "none", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo", 5: "lz4", 6: "zstd"}
 
@@ -42,8 +84,14 @@ class Image:
     def payload(self):
         return self.data[HDR_LEN:HDR_LEN + self.size]
 
+    def gunzip(self):
+        """The inflated payload of a vendor image."""
+        return zlib.decompressobj(31).decompress(self.payload)
+
     def lzma_offset(self):
         """Offset of the LZMA-alone stream appended after rt-loader."""
+        if self.comp == COMP_GZIP:
+            return None
         for m in re.finditer(rb"\x5d\x00\x00", self.data):
             off = m.start()
             if off < HDR_LEN:
@@ -57,6 +105,8 @@ class Image:
         return None
 
     def kernel(self):
+        if self.comp == COMP_GZIP:
+            return self.gunzip()
         off = self.lzma_offset()
         if off is None:
             raise ValueError("no LZMA kernel found in payload")
@@ -116,15 +166,60 @@ def fdt_to_dts(dtb):
     return "\n".join(out) + "\n"
 
 
+def load(path):
+    """The image in a file, or the .bix inside a vendor download's zip."""
+    data = open(path, "rb").read()
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = [n for n in z.namelist() if n.lower().endswith(".bix")]
+            if len(names) != 1:
+                raise ValueError(f"expected one .bix in {path}, found {names}")
+            data = z.read(names[0])
+    return Image(data)
+
+
+def uboot_env(variables):
+    """A U-Boot environment sector: CRC32, then NUL-separated name=value."""
+    body = b"".join(f"{k}={v}".encode() + b"\0" for k, v in variables.items())
+    body = (body + b"\0").ljust(FLASH_ENV_SIZE - 4, b"\0")
+    return struct.pack(">I", zlib.crc32(body)) + body
+
+
+def mkflash(data, bdinfo, sysinfo):
+    if len(data) > FLASH_SIZE - FLASH_FIRMWARE:
+        raise ValueError("image does not fit the flash")
+    flash = bytearray(b"\xff" * FLASH_SIZE)
+    flash[0:len(LOADER_STUB)] = LOADER_STUB
+    flash[FLASH_BDINFO:FLASH_BDINFO + FLASH_ENV_SIZE] = uboot_env(bdinfo)
+    flash[FLASH_SYSINFO:FLASH_SYSINFO + FLASH_ENV_SIZE] = uboot_env(sysinfo)
+    flash[FLASH_FIRMWARE:FLASH_FIRMWARE + len(data)] = data
+    return bytes(flash)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["info", "extract-kernel", "dtb", "dts"])
+    ap.add_argument("command", choices=["info", "extract-kernel", "dtb", "dts",
+                                        "mkflash"])
     ap.add_argument("image")
     ap.add_argument("-o", "--output")
+    ap.add_argument("--bdinfo", action="append", default=[], metavar="NAME=VALUE",
+                    help="mkflash: set a variable in the U-Boot environment")
+    ap.add_argument("--sysinfo", action="append", default=[], metavar="NAME=VALUE",
+                    help="mkflash: set a variable in the second environment")
     args = ap.parse_args()
 
-    img = Image(open(args.image, "rb").read())
+    img = load(args.image)
+
+    if args.command == "mkflash":
+        if not args.output:
+            ap.error("mkflash needs -o")
+        bdinfo, sysinfo = dict(DEFAULT_BDINFO), dict(DEFAULT_SYSINFO)
+        for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
+            env.update(v.split("=", 1) for v in given)
+        open(args.output, "wb").write(mkflash(img.data, bdinfo, sysinfo))
+        print(f"wrote {FLASH_SIZE} bytes to {args.output}", file=sys.stderr)
+        return
 
     if args.command == "info":
         vendor = " (vendor magic)" if img.magic == RTL_MAGIC else ""
@@ -143,6 +238,12 @@ def main():
                 print(f"appended dtb {len(dtb)} bytes")
             except ValueError as e:
                 print(f"appended dtb: {e}")
+        elif img.comp == COMP_GZIP:
+            k = img.gunzip()
+            print(f"gzip kernel 0x{HDR_LEN:04x}.. -> {len(k)} bytes uncompressed")
+            m = re.search(rb"Linux version [^\n]*", k)
+            if m:
+                print(f"            {m.group().decode('ascii', 'replace')}")
         return
 
     blob = {"extract-kernel": img.kernel, "dtb": img.dtb}.get(args.command)

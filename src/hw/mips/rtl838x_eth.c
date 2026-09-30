@@ -26,7 +26,9 @@
  *    while expecting the hardware to replace them -- on a DSA frame they are
  *    the [port, 0xab, 0xcd, 0xef] trailer the tag driver deliberately left
  *    there for exactly this purpose.  So: strip four bytes on the way out,
- *    append four on the way in.
+ *    append four on the way in.  The exception is a frame too short to be
+ *    on a wire at all, which the hardware pads instead; the vendor SDK
+ *    queues those without the four bytes.
  *
  *  - Reason 6 ("special trap") is the only value that makes the driver clear
  *    l2_offloaded, which is what stops the bridge from assuming the switch has
@@ -46,7 +48,9 @@
 
 /* Registers, all offsets inside the switch window. */
 #define ETH_DMA_RX_BASE         0x9f00  /* + ring * 4 */
+#define ETH_DMA_RX_CUR          0x9f20  /* + ring * 4, read only */
 #define ETH_DMA_TX_BASE         0x9f40  /* + ring * 4 */
+#define ETH_DMA_TX_CUR          0x9f48  /* + ring * 4, read only */
 #define ETH_DMA_IF_INTR_MSK     0x9f50
 #define ETH_DMA_IF_INTR_STS     0x9f54
 #define ETH_DMA_IF_CTRL         0x9f58
@@ -61,6 +65,11 @@
 #define ETH_CTRL_TX_FETCH       (1u << 1)
 #define ETH_CTRL_ENABLE         (3u << 2)
 
+/* Interrupt status: receive ran out in [7:0], received in [15:8], one bit a
+ * ring; then transmitted and "everything queued was transmitted" per ring. */
+#define ETH_INTR_TX_DONE(r)     (1u << (16 + (r)))
+#define ETH_INTR_TX_ALL_DONE(r) (1u << (18 + (r)))
+
 /* Ring entry. */
 #define RING_OWN_HW             (1u << 0)
 #define RING_WRAP               (1u << 1)
@@ -71,7 +80,8 @@
 #define FRAG_SIZE               0x06    /* u16, buffer capacity */
 #define FRAG_FLAGS              0x08    /* u16, more in bit 15, offset below */
 #define FRAG_LEN                0x0a    /* u16, bytes in this fragment */
-#define FRAG_CPU_TAG            0x0c    /* u16[10] */
+#define FRAG_CPU_TAG            0x0c    /* u16[6], then 8 bytes of the driver's */
+#define FRAG_CPU_TAG_WORDS      6
 #define FRAG_MORE               (1u << 15)
 
 /* CPU tag fields the driver puts there (transmit) and reads back (receive). */
@@ -209,9 +219,23 @@ static bool rtl838x_eth_tx_frame(RTL838xSwitchState *s, unsigned ring,
         return true;    /* runt, or a frame we gave up on; the slot is freed */
     }
 
-    eth_dbg("tx ring %u: %zu bytes, dpm 0x%08x%s\n", ring, len - ETH_FCS_LEN,
+    if (len >= ETH_ZLEN + ETH_FCS_LEN) {
+        len -= ETH_FCS_LEN;
+    } else {
+        /*
+         * Shorter than the wire allows: no room was left for an FCS, and the
+         * hardware pads what it was given.  Linux never gets here, it pads
+         * and adds the four bytes itself.  The vendor driver adds them only
+         * to frames that are long enough already, so its ARP requests arrive
+         * as 42 bytes, all of them payload.
+         */
+        memset(frame + len, 0, ETH_ZLEN - len);
+        len = ETH_ZLEN;
+    }
+
+    eth_dbg("tx ring %u: %zu bytes, dpm 0x%08x%s\n", ring, len,
             dpm, as_dpm ? "" : " (no tag)");
-    rtl838x_fwd_from_cpu(s, frame, len - ETH_FCS_LEN, dpm, as_dpm);
+    rtl838x_fwd_from_cpu(s, frame, len, dpm, as_dpm);
 
     return true;
 }
@@ -224,14 +248,26 @@ static void rtl838x_eth_tx(RTL838xSwitchState *s)
 
     for (unsigned ring = 0; ring < RTL838X_ETH_TX_RINGS; ring++) {
         uint32_t base = s->regs[(ETH_DMA_TX_BASE + ring * 4) / 4];
+        bool sent = false;
 
         if (!base) {
             continue;
         }
         while (rtl838x_eth_tx_frame(s, ring, base)) {
             /* Drain the ring: one trigger may cover several queued frames. */
+            sent = true;
+        }
+        if (sent) {
+            /*
+             * The Linux driver reclaims its buffers from the ownership bits
+             * and only acknowledges this; the vendor SDK frees a transmitted
+             * packet from the interrupt and leaks it without one.
+             */
+            s->regs[ETH_DMA_IF_INTR_STS / 4] |= ETH_INTR_TX_DONE(ring) |
+                                                ETH_INTR_TX_ALL_DONE(ring);
         }
     }
+    rtl838x_eth_update_irq(s);
 }
 
 /* ---------------------------------------------------------------- receive */
@@ -313,8 +349,13 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
          * one's, but leaving stale values behind in the others is asking for
          * confusion later.  Word 1 carries the source port and queue, word 4
          * the reason.
+         *
+         * The tag is six words.  Linux declares ten, which takes the
+         * descriptor to a round 32 bytes, but the last eight bytes are the
+         * driver's to use: the vendor SDK keeps two pointers of its own
+         * there and follows them from its interrupt handler.
          */
-        for (unsigned w = 0; w < 10; w++) {
+        for (unsigned w = 0; w < FRAG_CPU_TAG_WORDS; w++) {
             eth_stw(frag + FRAG_CPU_TAG + w * 2, 0);
         }
         eth_stw(frag + FRAG_CPU_TAG + 1 * 2, src_port & 0x1f);
@@ -340,6 +381,32 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
 }
 
 /* --------------------------------------------------------------- registers */
+
+/*
+ * Where the engine is in each ring, as the address of the entry it will look
+ * at next.  The vendor SDK reads the transmit one to find out how far the
+ * hardware got.
+ */
+bool rtl838x_eth_read(RTL838xSwitchState *s, hwaddr addr, uint32_t *val)
+{
+    if (addr >= ETH_DMA_RX_CUR &&
+        addr < ETH_DMA_RX_CUR + RTL838X_ETH_RX_RINGS * 4) {
+        unsigned ring = (addr - ETH_DMA_RX_CUR) / 4;
+
+        *val = s->regs[(ETH_DMA_RX_BASE + ring * 4) / 4] +
+               s->rx_cursor[ring] * 4;
+        return true;
+    }
+    if (addr >= ETH_DMA_TX_CUR &&
+        addr < ETH_DMA_TX_CUR + RTL838X_ETH_TX_RINGS * 4) {
+        unsigned ring = (addr - ETH_DMA_TX_CUR) / 4;
+
+        *val = s->regs[(ETH_DMA_TX_BASE + ring * 4) / 4] +
+               s->tx_cursor[ring] * 4;
+        return true;
+    }
+    return false;
+}
 
 bool rtl838x_eth_write(RTL838xSwitchState *s, hwaddr addr, uint32_t val)
 {

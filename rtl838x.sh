@@ -29,6 +29,7 @@ image_host=""       # path on the host, for messages
 image_guest=""      # path the container sees
 image_mount=""      # extra docker -v argument, when the image is outside the repo
 image_consumed=0    # whether the image came from the command line
+image_mode=ro       # how an image outside the repository is mounted
 
 die() {
     echo "rtl838x: $*" >&2
@@ -36,11 +37,12 @@ die() {
 }
 
 # Run in a container as the invoking user, so nothing in the repository ends
-# up owned by root.  Interactive only when there is a terminal to attach to.
+# up owned by root.  A terminal when there is one to attach to; otherwise stdin
+# is still passed on, so that the console can be driven through a pipe.
 in_container() {
     image=$1
     shift
-    tty=""
+    tty="-i"
     [ -t 0 ] && tty="-it"
     # shellcheck disable=SC2086
     "$DOCKER" run --rm $tty \
@@ -69,7 +71,7 @@ resolve_image() {
             ;;
         *)
             image_guest=/image/$(basename "$abs")
-            image_mount="-v $abs:$image_guest:ro"
+            image_mount="-v $abs:$image_guest:$image_mode"
             ;;
     esac
 }
@@ -94,6 +96,13 @@ usage: ./rtl838x.sh <command> [arguments]
   run-log [image] [...]   boot with unimplemented-register logging to
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
+  test-stock <image>      the same for a vendor (Zyxel .bix) image, which is
+                          installed into a scratch flash and booted from it
+  mkflash <image> <flash> write a 16 MiB flash image with the firmware
+                          installed and a U-Boot environment; extra arguments
+                          go to "imgtool.py mkflash"
+  run-flash <flash> [...] boot what is installed in a flash image, the way the
+                          stock bootloader does; writes go to the file
   shell                   open a shell in the build container
   info [image]            summarise a firmware image
   dts [image]             print the device tree embedded in a firmware image
@@ -147,6 +156,30 @@ cmd_run() {
     run_qemu "$@"
 }
 
+# No -kernel: the machine loads the uImage from the flash's first image slot.
+cmd_run_flash() {
+    [ $# -ge 1 ] || die "run-flash needs a flash image"
+    image_mode=rw
+    resolve_image "$1"
+    shift
+    cmd_runtime_image
+    echo "booting from flash $image_host" >&2
+    in_container "$RUNTIME" "$QEMU" \
+        -M rtl838x -m 128 -nographic -no-reboot \
+        -drive "if=mtd,format=raw,file=$image_guest" "$@"
+}
+
+cmd_mkflash() {
+    [ $# -ge 2 ] || die "mkflash needs a firmware image and a flash image to write"
+    resolve_image "$1"
+    case $2 in
+        /*) out=$2 ;;
+        *)  out=$invocation_dir/$2 ;;
+    esac
+    shift 2
+    python3 scripts/imgtool.py mkflash "$image_host" -o "$out" "$@"
+}
+
 cmd_run_log() {
     take_image "$@"
     if [ "$image_consumed" = 1 ]; then shift; fi
@@ -160,6 +193,14 @@ cmd_test() {
     if [ "$image_consumed" = 1 ]; then shift; fi
     cmd_runtime_image
     in_container "$RUNTIME" python3 tests/test_boot.py --image "$image_guest" "$@"
+}
+
+cmd_test_stock() {
+    [ $# -ge 1 ] || die "test-stock needs a vendor firmware image"
+    resolve_image "$1"
+    shift
+    cmd_runtime_image
+    in_container "$RUNTIME" python3 tests/test_stock.py --image "$image_guest" "$@"
 }
 
 cmd_shell() {
@@ -195,7 +236,10 @@ case "${1:-help}" in
     runtime-image)    shift; cmd_runtime_image ;;
     run)              shift; cmd_run "$@" ;;
     run-log)          shift; cmd_run_log "$@" ;;
+    run-flash)        shift; cmd_run_flash "$@" ;;
+    mkflash)          shift; cmd_mkflash "$@" ;;
     test)             shift; cmd_test "$@" ;;
+    test-stock)       shift; cmd_test_stock "$@" ;;
     shell)            shift; cmd_shell ;;
     info)             shift; cmd_info "$@" ;;
     dts)              shift; cmd_dts "$@" ;;

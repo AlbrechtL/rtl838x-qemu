@@ -8,10 +8,14 @@
  * image slot -- on every reset, so that a reboot after a firmware update
  * starts the new firmware.
  *
- * The kernel carries its device tree appended to itself
+ * The OpenWrt kernel carries its device tree appended to itself
  * (CONFIG_MIPS_RAW_APPENDED_DTB=y), so this board never builds or passes a
  * DTB.  That cuts both ways: the guest tells us nothing, and the addresses
  * below have to match the device tree inside the image exactly.
+ *
+ * The vendor firmware, a Linux 2.6.19 with Realtek's SDK in modules, has no
+ * device tree at all and boots on the same machine.  It wants to be booted
+ * from flash, with the chip it knows: see the flash-model property.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -49,11 +53,25 @@
  * The payload is not the kernel: it is OpenWrt's rt-loader with the
  * LZMA-compressed kernel appended, which relocates itself, decompresses and
  * jumps.  Running that as-is is the point, so that the shipped image boots
- * unmodified.
+ * unmodified.  The vendor's images use the same magic around a gzip'ed
+ * kernel, which the bootloader, and so this machine, inflates.
  */
 #define UIMAGE_MAGIC        0x27051956
 #define UIMAGE_MAGIC_RTL    0x83800000
 #define UIMAGE_HEADER_SIZE  64
+#define UIMAGE_COMP_NONE    0
+#define UIMAGE_COMP_GZIP    1
+/* Room to unpack a gzip payload into; the vendor kernel is under 8 MiB. */
+#define UIMAGE_UNPACK_MAX   (32 * MiB)
+
+struct RTL838xMachineState {
+    MachineState parent_obj;
+
+    char *flash_model;
+};
+
+#define TYPE_RTL838X_MACHINE MACHINE_TYPE_NAME("rtl838x")
+OBJECT_DECLARE_SIMPLE_TYPE(RTL838xMachineState, RTL838X_MACHINE)
 
 typedef struct ResetData {
     MIPSCPU *cpu;
@@ -122,13 +140,40 @@ static uint32_t rtl838x_check_uimage(const uint8_t *hdr, uint64_t len,
                    what, payload);
         return 0;
     }
-    if (hdr[31] != 0) {
+    if (hdr[31] != UIMAGE_COMP_NONE && hdr[31] != UIMAGE_COMP_GZIP) {
         error_setg(errp, "uImage in %s has a compressed payload (type %u); "
-                   "this machine expects the uncompressed rt-loader",
+                   "only uncompressed and gzip payloads are supported",
                    what, hdr[31]);
         return 0;
     }
     return payload;
+}
+
+/*
+ * What the bootloader's bootm does with the payload before jumping to it.
+ * OpenWrt's is the uncompressed rt-loader and is used as it is; the vendor
+ * firmware's is a gzip'ed kernel, which the bootloader inflates to the load
+ * address.  Returns the bytes to place there, which the caller frees.
+ */
+static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload,
+                                      uint32_t *size, const char *what,
+                                      Error **errp)
+{
+    g_autofree uint8_t *out = NULL;
+    ssize_t len;
+
+    if (hdr[31] == UIMAGE_COMP_NONE) {
+        return g_memdup2(payload, *size);
+    }
+
+    out = g_malloc(UIMAGE_UNPACK_MAX);
+    len = gunzip(out, UIMAGE_UNPACK_MAX, (uint8_t *)payload, *size);
+    if (len < 0) {
+        error_setg(errp, "could not gunzip the uImage in %s", what);
+        return NULL;
+    }
+    *size = len;
+    return g_realloc(g_steal_pointer(&out), len);
 }
 
 /*
@@ -142,6 +187,7 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
     const uint64_t len = RTL838X_FLASH_SIZE - RTL838X_FLASH_FIRMWARE;
     uint8_t hdr[UIMAGE_HEADER_SIZE];
     g_autofree uint8_t *payload = NULL;
+    g_autofree uint8_t *image = NULL;
     uint32_t magic, size;
     uint64_t load, ep;
 
@@ -172,9 +218,13 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
         error_setg(errp, "could not read the flash");
         return 0;
     }
+    image = rtl838x_unpack_uimage(hdr, payload, &size, "flash", errp);
+    if (!image) {
+        return 0;
+    }
     address_space_write(&address_space_memory,
                         cpu_mips_kseg0_to_phys(NULL, load),
-                        MEMTXATTRS_UNSPECIFIED, payload, size);
+                        MEMTXATTRS_UNSPECIFIED, image, size);
     return ep;
 }
 
@@ -207,11 +257,14 @@ static uint64_t rtl838x_load_kernel(MachineState *machine)
             g_autofree char *name = g_strndup(buf + 32, 32);
             uint32_t payload = rtl838x_check_uimage(hdr, len, filename,
                                                     &error_fatal);
+            g_autofree uint8_t *image =
+                rtl838x_unpack_uimage(hdr, hdr + UIMAGE_HEADER_SIZE, &payload,
+                                      filename, &error_fatal);
 
             info_report("loading uImage '%s' (%u bytes) at 0x%" PRIx64
                         ", entry 0x%" PRIx64, name, payload, load, ep);
-            rom_add_blob_fixed("rtl838x.kernel", buf + UIMAGE_HEADER_SIZE,
-                               payload, cpu_mips_kseg0_to_phys(NULL, load));
+            rom_add_blob_fixed("rtl838x.kernel", image, payload,
+                               cpu_mips_kseg0_to_phys(NULL, load));
             return ep;
         }
     }
@@ -230,6 +283,7 @@ static uint64_t rtl838x_load_kernel(MachineState *machine)
 
 static void rtl838x_init(MachineState *machine)
 {
+    RTL838xMachineState *rms = RTL838X_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *sram = g_new(MemoryRegion, 1);
     MemoryRegion *sram_alias = g_new(MemoryRegion, 1);
@@ -291,7 +345,12 @@ static void rtl838x_init(MachineState *machine)
      * backed by "-drive if=mtd" when there is one.
      */
     flash_dinfo = drive_get(IF_MTD, 0, 0);
-    flash = qdev_new(RTL838X_FLASH_TYPE);
+    if (!object_class_by_name(rms->flash_model)) {
+        error_report("flash-model '%s' is not a flash chip QEMU models",
+                     rms->flash_model);
+        exit(1);
+    }
+    flash = qdev_new(rms->flash_model);
     if (flash_dinfo) {
         qdev_prop_set_drive_err(flash, "drive",
                                 blk_by_legacy_dinfo(flash_dinfo), &error_fatal);
@@ -401,8 +460,40 @@ static void rtl838x_init(MachineState *machine)
     }
 }
 
-static void rtl838x_machine_init(MachineClass *mc)
+static char *rtl838x_get_flash_model(Object *obj, Error **errp)
 {
+    return g_strdup(RTL838X_MACHINE(obj)->flash_model);
+}
+
+static void rtl838x_set_flash_model(Object *obj, const char *value,
+                                    Error **errp)
+{
+    RTL838xMachineState *rms = RTL838X_MACHINE(obj);
+
+    g_free(rms->flash_model);
+    rms->flash_model = g_strdup(value);
+}
+
+static void rtl838x_machine_instance_init(Object *obj)
+{
+    RTL838X_MACHINE(obj)->flash_model = g_strdup(RTL838X_FLASH_TYPE);
+}
+
+static void rtl838x_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    /*
+     * Which chip the 16 MiB flash identifies as.  The two firmwares disagree:
+     * a current kernel needs SFDP tables from a chip with the real one's
+     * JEDEC ID, which QEMU's model of it lacks, hence the default; the vendor
+     * kernel knows nothing but the real ID, c2 20 18, "mx25l12805d" here.
+     */
+    object_class_property_add_str(oc, "flash-model", rtl838x_get_flash_model,
+                                  rtl838x_set_flash_model);
+    object_class_property_set_description(oc, "flash-model",
+        "m25p80 model of the SPI-NOR flash (default " RTL838X_FLASH_TYPE ")");
+
     mc->desc = "Realtek RTL8380M switch SoC";
     mc->init = rtl838x_init;
     /* 4KEc plus MIPS16e; see patches/rtl838x.patch for why that matters. */
@@ -420,4 +511,14 @@ static void rtl838x_machine_init(MachineClass *mc)
     mc->max_cpus = 1;
 }
 
-DEFINE_MACHINE("rtl838x", rtl838x_machine_init)
+static const TypeInfo rtl838x_machine_types[] = {
+    {
+        .name          = TYPE_RTL838X_MACHINE,
+        .parent        = TYPE_MACHINE,
+        .instance_size = sizeof(RTL838xMachineState),
+        .instance_init = rtl838x_machine_instance_init,
+        .class_init    = rtl838x_machine_class_init,
+    },
+};
+
+DEFINE_TYPES(rtl838x_machine_types)

@@ -37,6 +37,13 @@
 #define FWD_L2_FLD_UC(v)        ((v) & 0x1ff)
 #define FWD_L2_FLD_BC(v)        (((v) >> 9) & 0x1ff)
 
+/*
+ * Bit 0 has ARP requests copied to the CPU port whether or not it is in the
+ * VLAN they arrived in.  The vendor firmware keeps the CPU port out of every
+ * VLAN and relies on this to hear who is asking for its address.
+ */
+#define FWD_SPCL_TRAP_ARP_CTRL  0x698c
+
 /* Spanning tree states, two bits per port in the MSTI table. */
 #define STP_DISABLED            0
 #define STP_BLOCKING            1
@@ -216,6 +223,14 @@ static bool fwd_is_trapped(const uint8_t *buf, size_t len)
     return len >= ETH_HLEN && lduw_be_p(buf + 12) == 0x888e;
 }
 
+static bool fwd_is_arp_request(const uint8_t *buf, size_t len, bool tagged)
+{
+    size_t l2 = ETH_HLEN + (tagged ? 4 : 0);
+
+    return len >= l2 + 8 && lduw_be_p(buf + l2 - 2) == ETH_P_ARP &&
+           lduw_be_p(buf + l2 + 6) == 1;
+}
+
 /* The VLAN a frame belongs to, and whether it arrived carrying a tag. */
 static uint16_t fwd_classify(RTL838xSwitchState *s, unsigned port,
                              const uint8_t *buf, size_t len, bool *tagged,
@@ -346,6 +361,13 @@ static uint32_t fwd_destination(RTL838xSwitchState *s, uint16_t vid,
     }
 
     port = fwd_lookup(s, fid, dst);
+    if (port == RTL838X_SW_CPU_PORT) {
+        /*
+         * An address of the switch's own.  VLAN egress filtering is about
+         * which wires a frame may leave on, and this one is not leaving.
+         */
+        return 1u << port;
+    }
     if (port >= 0) {
         return members & (1u << port);
     }
@@ -396,6 +418,10 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
     }
 
     mask = fwd_filter(s, fwd_destination(s, vid, fid, buf), port);
+    if (fwd_is_arp_request(buf, len, tagged) &&
+        (s->regs[FWD_SPCL_TRAP_ARP_CTRL / 4] & 1)) {
+        mask |= 1u << RTL838X_SW_CPU_PORT;
+    }
     fwd_dbg("port %u: vlan %u members 0x%08x iso 0x%08x -> mask 0x%08x\n",
             port, vid, members, s->regs[FWD_PORT_ISO_CTRL(port) / 4], mask);
     fwd_egress(s, mask, port, vid, pcp, tagged, buf, len, FWD_REASON_FORWARD);
@@ -438,6 +464,9 @@ void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
 
     mask = fwd_filter(s, fwd_destination(s, vid, fid, buf),
                       RTL838X_SW_CPU_PORT);
+    fwd_dbg("cpu port: vlan %u members 0x%08x iso 0x%08x -> mask 0x%08x\n",
+            vid, fwd_vlan_members(s, vid),
+            s->regs[FWD_PORT_ISO_CTRL(RTL838X_SW_CPU_PORT) / 4], mask);
     fwd_egress(s, mask, RTL838X_SW_CPU_PORT, vid, pcp, tagged, buf, len,
                FWD_REASON_FORWARD);
 }

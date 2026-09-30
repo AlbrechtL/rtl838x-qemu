@@ -18,7 +18,8 @@
  * probe, with no output.
  *
  * The flash is QEMU's m25p80 model of a Macronix MX25L12855E, 16 MiB with
- * 64 KiB sectors, the geometry the GS1900's partition map is laid out for.
+ * 64 KiB sectors, the geometry the GS1900's partition map is laid out for,
+ * unless the machine's flash-model property names another chip.
  * Its contents come from "-drive if=mtd", which must be exactly 16 MiB;
  * without one the flash starts erased and forgets everything when QEMU
  * exits.

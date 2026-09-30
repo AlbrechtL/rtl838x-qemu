@@ -109,6 +109,8 @@
  * MAC_LINK_STS twice because the real register is latched.
  */
 #define SW_MAC_LINK_STS         0xa188
+#define SW_MAC_LINK_SPD_STS     0xa190  /* two bits per port, 2 = 1000 Mb/s */
+#define SW_MAC_LINK_DUP_STS     0xa19c  /* one bit per port, set = full */
 #define SW_IMR_GLB              0x1100
 #define SW_IMR_PORT_LINK_CHG    0x1104
 
@@ -119,6 +121,14 @@
 #define SW_SMI_ACCESS_PHY_CTRL1 0xa1bc  /* command, bit 0 = run */
 #define SW_SMI_ACCESS_PHY_CTRL2 0xa1c0  /* data in [31:16], out [15:0] */
 #define SW_SMI_ACCESS_PHY_CTRL3 0xa1c4  /* clause 45 address */
+#define SW_SMI_PORT0_5_ADDR     0xa1c8  /* PHY address per port, 5 bits each */
+#define SW_SMI_PORTS_PER_REG    6
+#define SW_SMI_PORTS            28
+
+/* Reset values the forwarding engine reads; see rtl838x_switch_reset(). */
+#define SW_PORT_ISO_CTRL(p)     (0x4100 + (p) * 4)
+#define SW_ALL_PORTS            0x1fffffff
+#define SW_MC_PMSK_FLOOD_ROW    511
 
 #define SW_SMI_RUN              (1u << 0)
 #define SW_SMI_CMD_MASK         (3u << 1)
@@ -135,6 +145,7 @@
 #define MII_STAT1000            10
 
 #define BMCR_RESET              (1u << 15)
+#define BMCR_PDOWN              (1u << 11)
 #define BMCR_ANRESTART          (1u << 9)
 
 #define BMSR_LSTATUS            (1u << 2)
@@ -269,6 +280,9 @@ static void rtl838x_phy_write(RTL838xSwitchState *s, uint32_t port_mask,
         }
 
         if (reg == MII_BMCR) {
+            bool was_up = rtl838x_switch_link_up(s, port);
+            bool renegotiate = val & (BMCR_RESET | BMCR_ANRESTART);
+
             /*
              * Reset and restart-autonegotiation are self-clearing.  Storing
              * them verbatim leaves the driver waiting for an negotiation that
@@ -276,9 +290,23 @@ static void rtl838x_phy_write(RTL838xSwitchState *s, uint32_t port_mask,
              */
             if (val & BMCR_RESET) {
                 rtl838x_phy_reset_one(s, port);
-                continue;
+            } else {
+                s->phy[port - RTL838X_SW_PORT_FIRST][MII_BMCR] =
+                    val & ~BMCR_ANRESTART;
             }
-            val &= ~(BMCR_RESET | BMCR_ANRESTART);
+
+            /*
+             * Powering the PHY down takes the link with it, and a reset or a
+             * new negotiation drops it and brings it back.  Either way the
+             * MAC sees its link change.  Linux follows the PHY and does not
+             * care; the vendor firmware resets every PHY as the last thing
+             * its bring-up does and waits for exactly this interrupt.
+             */
+            if (was_up != rtl838x_switch_link_up(s, port) ||
+                (was_up && renegotiate)) {
+                rtl838x_switch_link_changed(s, port);
+            }
+            continue;
         }
         s->phy[port - RTL838X_SW_PORT_FIRST][reg % RTL838X_SW_PHY_REGS] = val;
     }
@@ -342,6 +370,11 @@ bool rtl838x_switch_link_up(RTL838xSwitchState *s, unsigned port)
         return true;    /* the CPU port is wired to the SoC, not to a cable */
     }
     if (port < RTL838X_SW_PORT_FIRST || port > RTL838X_SW_PORT_LAST) {
+        return false;
+    }
+
+    /* A powered-down PHY has no link, whatever is plugged into the port. */
+    if (s->phy[port - RTL838X_SW_PORT_FIRST][MII_BMCR] & BMCR_PDOWN) {
         return false;
     }
 
@@ -465,9 +498,35 @@ static int rtl838x_table_window(hwaddr addr)
 static uint64_t rtl838x_switch_read(void *opaque, hwaddr addr, unsigned size)
 {
     RTL838xSwitchState *s = opaque;
+    uint32_t val;
 
-    if (addr == SW_MAC_LINK_STS) {
+    switch (addr) {
+    case SW_MAC_LINK_STS:
         return rtl838x_switch_link_mask(s);
+    case SW_MAC_LINK_DUP_STS:
+        return rtl838x_switch_link_mask(s);
+    case SW_MAC_LINK_SPD_STS: {
+        /*
+         * What the MACs resolved the links to, which is what the PHYs say
+         * they negotiated: 1000 Mb/s, full duplex.  Only ports 0..15 fit in
+         * this register, and the front panel is within them.  The Linux
+         * driver learns this from the PHYs; the vendor SDK asks here.
+         */
+        uint32_t up = rtl838x_switch_link_mask(s), spd = 0;
+
+        for (unsigned p = 0; p < 16; p++) {
+            if (up & (1u << p)) {
+                spd |= 2u << (2 * p);
+            }
+        }
+        return spd;
+    }
+    default:
+        break;
+    }
+
+    if (rtl838x_eth_read(s, addr, &val)) {
+        return val;
     }
 
     return s->regs[addr / 4];
@@ -526,6 +585,8 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
         return;
 
     case SW_MAC_LINK_STS:
+    case SW_MAC_LINK_SPD_STS:
+    case SW_MAC_LINK_DUP_STS:
         return;     /* driven by the PHYs, not by the guest */
 
     case SW_SMI_ACCESS_PHY_CTRL1:
@@ -609,6 +670,18 @@ static void rtl838x_switch_reset(DeviceState *dev)
             ((uint32_t)a[2] << 24) | (a[3] << 16) | (a[4] << 8) | a[5];
     }
 
+    /*
+     * Which address on the MDIO bus each port's PHY answers at: its own port
+     * number, on this board.  The Linux driver passes the port and never
+     * looks, but the vendor SDK reads the address back out of here for every
+     * access, and with the registers at zero it would ask for the PHY at
+     * address 0 eight times over and find no PHYs at all.
+     */
+    for (unsigned p = 0; p < SW_SMI_PORTS; p++) {
+        s->regs[SW_SMI_PORT0_5_ADDR / 4 + p / SW_SMI_PORTS_PER_REG] |=
+            p << (5 * (p % SW_SMI_PORTS_PER_REG));
+    }
+
     for (unsigned w = 0; w < RTL838X_SW_TABLE_WINDOWS; w++) {
         for (unsigned t = 0; t < RTL838X_SW_TABLES_PER_WINDOW; t++) {
             const RTL838xTableDesc *d = &sw_table_windows[w].tables[t];
@@ -620,9 +693,32 @@ static void rtl838x_switch_reset(DeviceState *dev)
         }
     }
 
+    /*
+     * Out of reset nothing is isolated from anything, and the last row of
+     * the multicast port mask table -- the one L2_FLD_PMSK points at until
+     * told otherwise -- floods to every port.  Linux overwrites both before
+     * it lets a frame through.  The vendor SDK leaves the isolation matrix
+     * alone, and builds its flood mask by copying that row.
+     */
+    for (unsigned p = 0; p <= RTL838X_SW_CPU_PORT; p++) {
+        s->regs[SW_PORT_ISO_CTRL(p) / 4] = SW_ALL_PORTS;
+    }
+    *rtl838x_switch_table_row(s, RTL838X_TBL_MC_PMSK_WINDOW,
+                              RTL838X_TBL_MC_PMSK_TYPE,
+                              SW_MC_PMSK_FLOOD_ROW) = SW_ALL_PORTS;
+
     rtl838x_phy_reset(s);
     rtl838x_eth_reset(s);
     rtl838x_fwd_reset(s);
+
+    /*
+     * Out of reset every link is down, and the ports with a cable in them
+     * come up a moment later: a change, which is latched here as it is on
+     * the real switch.  The vendor firmware depends on it -- it only looks
+     * at a port's link after being told that it changed.
+     */
+    s->regs[SW_ISR_PORT_LINK_CHG / 4] =
+        rtl838x_switch_link_mask(s) & ~(1u << RTL838X_SW_CPU_PORT);
     qemu_set_irq(s->irq, 0);
 }
 
@@ -662,8 +758,8 @@ static void rtl838x_switch_init(Object *obj)
 
 static const VMStateDescription vmstate_rtl838x_switch = {
     .name = TYPE_RTL838X_SWITCH,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, RTL838xSwitchState, RTL838X_SW_REGS),
         VMSTATE_UINT16_2DARRAY(phy, RTL838xSwitchState, RTL838X_SW_NUM_PORTS,

@@ -43,7 +43,8 @@
 #define RTL838X_KERNEL_LOAD     0x80100000
 
 /*
- * The SPI-NOR flash: its model, and where in it the stock bootloader looks
+ * The SPI-NOR flash: its default model, which the machine's flash-model
+ * property overrides, and where in it the stock bootloader looks
  * for the uImage it boots.  0x260000 is the GS1900's first image slot, the
  * one "bootpartition=0" selects and the device tree's "firmware" partition
  * starts at.
@@ -150,8 +151,12 @@ typedef struct RTL838xPortState RTL838xPortState;
 #define RTL838X_TBL_MC_PMSK_WINDOW      0
 #define RTL838X_TBL_MC_PMSK_TYPE        2
 
-/* CPU-port DMA engine: the driver programs two rings in each direction. */
-#define RTL838X_ETH_RX_RINGS    2
+/*
+ * CPU-port DMA engine: eight receive rings, one per priority, and two
+ * transmit rings.  The Linux driver programs two of the eight and the vendor
+ * SDK all of them; received frames all go to the first.
+ */
+#define RTL838X_ETH_RX_RINGS    8
 #define RTL838X_ETH_TX_RINGS    2
 
 struct RTL838xSwitchState {
@@ -198,6 +203,7 @@ void rtl838x_port_send(RTL838xPortState *p, const uint8_t *buf, size_t len);
 
 /* rtl838x_eth.c: the CPU-port DMA engine. */
 bool rtl838x_eth_write(RTL838xSwitchState *s, hwaddr addr, uint32_t val);
+bool rtl838x_eth_read(RTL838xSwitchState *s, hwaddr addr, uint32_t *val);
 void rtl838x_eth_reset(RTL838xSwitchState *s);
 void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
                         unsigned reason, const uint8_t *buf, size_t len);

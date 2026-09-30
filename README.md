@@ -6,7 +6,9 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 The emulator is tested with the RTL8380M and RTL8382MI SoCs; other RTL838x SoCs
 may work as well. Both [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/)
 and [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/)
-can be run (the latter tested with Zyxel GS1900-8 hardware).
+can be run (the latter tested with Zyxel GS1900-8 hardware). So can Zyxel's own
+firmware for the GS1900-8, tested with V2.90(AAHH.2)C0: see
+[Vendor firmware](#vendor-firmware).
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
@@ -47,7 +49,8 @@ git submodule update --init      # QEMU, pinned at v11.1.1
 
 Other commands: `run-log` (adds `-d unimp,guest_errors` into `out/qemu.log`),
 `shell` (a shell in the build container), `info` and `dts` (inspect the
-firmware image), `clean`, `distclean`, `help`.
+firmware image), `mkflash`, `run-flash` and `test-stock` (for the
+[vendor firmware](#vendor-firmware)), `clean`, `distclean`, `help`.
 
 `run`, `run-log`, `test`, `info` and `dts` take the image as their first
 argument, defaulting to the one in `images/`. QEMU options all start with a
@@ -137,6 +140,155 @@ qemu-system-mips -M rtl838x -m 128 -nographic \
 so the flash file is left as it was when QEMU exits, while a reboot inside
 QEMU still sees the writes.
 
+Which chip the flash identifies as is the machine's `flash-model` property,
+any 16 MiB part QEMU's `m25p80` models: `-machine flash-model=mx25l12805d`
+gives the JEDEC ID of the chip that is actually soldered to the board, which
+is the only one the vendor firmware accepts.
+
+## Vendor firmware
+
+Zyxel's firmware for the GS1900-8 boots to its CLI and its web interface, and
+switches. It is a different animal from OpenWrt -- Linux 2.6.19, no device
+tree, and Realtek's SDK in a dozen proprietary kernel modules doing what DSA
+does -- so it is a second opinion on every device model here, from a driver
+written by the people who made the chip.
+
+The firmware is not in this repository. Tested is V2.90(AAHH.2)C0, from
+<https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip>;
+the zip can be used as it is, the tools take the `.bix` out of it.
+
+```sh
+./rtl838x.sh mkflash 'images/GS1900-8_2.90(AAHH.2)C0.zip' flash.bin
+./rtl838x.sh run-flash flash.bin -machine flash-model=mx25l12805d
+```
+
+About half a minute later, the first boot having generated its SSH host keys:
+
+```
+Probe: SPI CS1 Flash Type MX25L12845E
+Creating 7 MTD partitions on "Total SPI FLASH":
+0x00000000-0x00040000 : "LOADER"
+0x00040000-0x00050000 : "BDINFO"
+0x00050000-0x00060000 : "SYSINFO"
+0x00060000-0x00160000 : "JFFS2 CFG"
+0x00160000-0x00260000 : "JFFS2 LOG"
+0x00260000-0x00930000 : "RUNTIME"
+0x00930000-0x01000000 : "RUNTIME2"
+...
+Press any key to continue
+Username: admin
+Password: ****
+GS1900# show version
+Boot Version     : V0.0.0.0 | 01/01/2000
+Firmware Version : V2.90(AAHH.2) | 05/07/2026
+GS1900# show interfaces 1-8 status
+Port  Name                 Status      Vlan  Duplex  Speed    Type
+1                          connected   1     a-full  a-1000M  Copper
+2                          notconnect  1     auto    auto     Copper
+...
+```
+
+The account is the factory one, `admin` / `1234`, and the address the factory
+one too, 192.168.1.1. QEMU's user network can be renumbered to match, which
+makes the host 192.168.1.2 from the switch's side and puts the web interface
+on a local port:
+
+```sh
+out/qemu/bin/qemu-system-mips -M rtl838x,flash-model=mx25l12805d -m 128 \
+    -nographic -drive if=mtd,format=raw,file=flash.bin \
+    -nic user,net=192.168.1.0/24,host=192.168.1.2,hostfwd=tcp::8080-192.168.1.1:80
+```
+
+```
+$ ./rtl838x.sh test-stock 'images/GS1900-8_2.90(AAHH.2)C0.zip'
+the vendor kernel finds the flash        PASS
+the vendor partition map is created      PASS
+reaches the vendor CLI                   PASS
+logs in with the factory account         PASS
+show version names the firmware          PASS
+the three cabled ports are connected     PASS
+the uncabled ports are not               PASS
+the switch answers an arp for its address PASS
+port 1 to port 2 is switched in hardware PASS
+a frame is not reflected to its source   PASS
+the switch pings a host on port 3        PASS
+the web interface answers                PASS
+the configuration is saved to flash      PASS
+no kernel oops or fatal signals          PASS
+```
+
+### Why it wants a flash
+
+`./rtl838x.sh run` on the `.bix` loads and starts the kernel, but the firmware
+does not get far without a flash it recognises with the right things in it.
+`mkflash` writes a 16 MiB image holding:
+
+| Offset | Partition | Content |
+|---|---|---|
+| `0x000000` | `LOADER` | Erased, but for a placeholder U-Boot version string. There is no bootloader to install, the machine does its job, yet `show version` searches this partition for the string and fails without one. It reads the placeholder as `V0.0.0.0`. |
+| `0x040000` | `BDINFO` | A U-Boot environment. `--bdinfo name=value` adds to it. |
+| `0x050000` | `SYSINFO` | A second environment, the firmware's own: `bootpartition`, `bootmsg`, `resetdefault`. `--sysinfo name=value` adds to it. The board module reads it while loading and dereferences a null pointer if the flash did not probe. |
+| `0x060000` | `JFFS2 CFG`, `JFFS2 LOG` | Erased. The firmware formats them on first boot and keeps its configuration, keys and log there. |
+| `0x260000` | `RUNTIME` | The `.bix`, byte for byte. |
+
+The values in the two environments are this project's, enough for the firmware
+to come up, not a dump of a real switch.
+
+### What it took
+
+The `.bix` has the same vendor-magic uImage header as the OpenWrt image, but
+around a gzip'ed kernel loaded at `0x80000000`, where OpenWrt's is an
+uncompressed loader. The machine inflates it, as the bootloader's `bootm`
+would. Past that, everything the vendor firmware needed was something the
+hardware does and the Linux driver never notices:
+
+* **The flash has to be the real chip.** The vendor kernel has a table of 25
+  JEDEC IDs and no SFDP, and `c2 26 18` is not in it; a current kernel wants
+  SFDP tables from anything answering `c2 20 18`, which QEMU's model of that
+  chip does not have. Hence `flash-model`.
+* **`SMI_PORTn_ADDR` reset to the identity.** The SDK looks up the MDIO
+  address of each port's PHY in these registers before every access. At zero
+  it probes the PHY at address 0 for all ports and finds none.
+* **A PHY reset is a link change.** The SDK resets each PHY at the end of its
+  bring-up, and only looks at a port's link after the switch core's link-change
+  interrupt. Powering a PHY down now takes the link down, and a reset or a
+  restarted negotiation latches a change. The MAC's speed and duplex status
+  registers are modelled too, since that is where the SDK reads them.
+* **Isolation and flooding have reset values.** Nothing isolated, and the last
+  row of the multicast port mask table floods everywhere. The SDK builds its
+  own flood mask by copying that row.
+* **The CPU port is in no VLAN.** The SDK leaves it out of VLAN 1 on purpose.
+  Frames for the switch's own address reach it regardless, and broadcast ARP
+  requests because `SPCL_TRAP_ARP_CTRL` has them copied there.
+* **The descriptor's last eight bytes are the driver's.** The receive tag is
+  six words, not the ten the Linux driver declares. The SDK keeps two pointers
+  behind it and follows them from its interrupt handler; overwriting them was
+  a kernel panic on the first received frame.
+* **Short frames carry no FCS space.** The SDK adds four bytes to a frame's
+  length only if the frame is long enough for a wire already. An ARP request
+  is queued as 42 bytes, all of them payload, and the hardware pads it.
+* **Transmit raises an interrupt**, and the ring position registers read back.
+  The SDK frees a transmitted packet from the one after consulting the other.
+
+None of it changed what OpenWrt sees: `./rtl838x.sh test` passes as before.
+
+### What does not work
+
+* `show mac address-table` lists the switch's own address and nothing else.
+  The firmware reads the hardware's L2 table, and this machine keeps what it
+  learns in a table of its own; see [Known gaps](#known-gaps). Forwarding is
+  not affected.
+* The firmware makes up its MAC address from the one the machine programs into
+  the switch, which is random per QEMU process, and ignores `ethaddr`.
+* Port counters read zero, as they do under OpenWrt.
+* The second UART is only there with a second `-serial`; the firmware pokes it
+  regardless, which is the only `-d unimp` output a boot produces. The only
+  `guest_errors` one is the flash model not knowing command `0xff`, which the
+  vendor driver sends once while probing.
+* Untested: firmware upgrade from the CLI or the web interface, the second
+  image slot, SSH, SNMP, anything involving LAGs, ACLs, IGMP snooping, PoE or
+  more than one VLAN, and a reboot from inside the firmware.
+
 ## How the image boots
 
 `images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
@@ -151,7 +303,9 @@ it down:
 The machine parses that header, copies the payload to `0x80100000` and starts
 executing, so `rt-loader` runs exactly as it does on the real switch. From
 flash it does the same with the uImage at `0x260000`, see [Flash](#flash). ELF
-`vmlinux` files and raw kernels are also accepted.
+`vmlinux` files and raw kernels are also accepted, and so is a uImage whose
+payload is gzip'ed, which is inflated to its load address first: that is what
+the [vendor firmware](#vendor-firmware) is.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
 the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
@@ -198,8 +352,9 @@ anything:
   restart-autonegotiation bit is the same kind of trap in miniature: leave it
   set and every port stays down while everything else looks healthy.
 
-A full boot produces no `-d unimp,guest_errors` output at all, so nothing the
-guest touches is unmapped, and neither does moving traffic through it.
+A full boot of OpenWrt produces no `-d unimp,guest_errors` output at all, so
+nothing the guest touches is unmapped, and neither does moving traffic through
+it.
 
 ## How the data path works
 
@@ -271,11 +426,13 @@ src/include/hw/mips/rtl838x.h
 scripts/sync.sh     copies the models into qemu/ and applies patches/rtl838x.patch
 patches/rtl838x.patch  Kconfig, meson.build and CPU model changes to upstream files
 scripts/build.sh    configure + ninja, runs inside the build container
-scripts/imgtool.py  inspect/unpack the firmware image
+scripts/imgtool.py  inspect/unpack the firmware image, build a flash image
 docker/             build container and slim runtime container
 tests/test_boot.py  boots the image and checks it over the serial console,
                     including the data path, by plugging a socket netdev into
                     lan1 and lan2 and speaking Ethernet at them
+tests/test_stock.py the same for the vendor firmware, from a scratch flash and
+                    through the vendor CLI
 qemu/               submodule, pinned to v11.1.1
 ```
 
