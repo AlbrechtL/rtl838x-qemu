@@ -97,6 +97,15 @@
 
 /* CPU tag fields the driver puts there (transmit) and reads back (receive). */
 #define TAG_TX_MARKER           (1u << 10)  /* in word 1 */
+/*
+ * Word 1's top byte on receive: the tag's protocol, 4 for the RTL8380's, as an
+ * in-band CPU tag carries it right after its EtherType.  Linux only looks at
+ * the port below it.  The vendor SDK decodes the tag only when this byte is
+ * set; without it, it looks for an in-band tag in the frame instead, finds
+ * none, and the frame arrives from no port at all -- which spanning tree
+ * throws away.
+ */
+#define TAG_RX_PROTO            (4u << 8)   /* in word 1 */
 #define TAG_TX_AS_DPM           (1u << 9)   /* in word 2 */
 
 /*
@@ -376,7 +385,7 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
         for (unsigned w = 0; w < FRAG_CPU_TAG_WORDS; w++) {
             eth_stw(frag + FRAG_CPU_TAG + w * 2, 0);
         }
-        eth_stw(frag + FRAG_CPU_TAG + 1 * 2, src_port & 0x1f);
+        eth_stw(frag + FRAG_CPU_TAG + 1 * 2, TAG_RX_PROTO | (src_port & 0x1f));
         eth_stw(frag + FRAG_CPU_TAG + 4 * 2, reason & 0xf);
 
         /* Ownership last: everything above must be visible before the CPU

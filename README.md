@@ -317,6 +317,17 @@ hardware does and the Linux driver never notices:
   is queued as 42 bytes, all of them payload, and the hardware pads it.
 * **Transmit raises an interrupt**, and the ring position registers read back.
   The SDK frees a transmitted packet from the one after consulting the other.
+* **The receive tag names its protocol.** The top byte of the tag's second
+  word is 4, as an in-band RTL8380 CPU tag has it after its EtherType. The
+  SDK decodes the tag only when it is set; without it, it looks for an
+  in-band tag in the frame, finds none, and the frame comes from no port.
+  ARP did not mind; spanning tree threw every BPDU away, and a looped
+  topology stormed.
+* **It switches on the outer VLAN tag.** `VLAN_PORT_FWD` has every port
+  classify by the outer tag, whose PVID is the upper half of `PB_VLAN`, and
+  `VLAN_PORT_ACCEPT_FRAME_TYPE` and `VLAN_PORT_IGR_FLTR` say what a port
+  admits. Read as the inner tag, as OpenWrt uses it, every port stayed in
+  VLAN 1 whatever the CLI configured.
 
 None of it changed what OpenWrt sees: `./rtl838x.sh test` passes as before.
 
@@ -332,8 +343,10 @@ None of it changed what OpenWrt sees: `./rtl838x.sh test` passes as before.
   `guest_errors` one is the flash model not knowing command `0xff`, which the
   vendor driver sends once while probing.
 * Untested: firmware upgrade from the CLI or the web interface, the second
-  image slot, SSH, SNMP, anything involving LAGs, ACLs, IGMP snooping, PoE or
-  more than one VLAN, and a reboot from inside the firmware.
+  image slot, SSH, SNMP, anything involving LAGs, ACLs, IGMP snooping or PoE,
+  and a reboot from inside the firmware. RSTP and VLANs are exercised by
+  [ethernet-switch-os-test](https://github.com/AlbrechtL/ethernet-switch-os-test)'s
+  suites, which run against this firmware too.
 
 ## Teltonika firmware
 
@@ -471,6 +484,13 @@ pass as before.
   counters.
 * The `u-boot` partition is empty, so the kernel cannot read a bootloader
   version from it, and says so.
+* Every broadcast and multicast frame leaves the other ports twice, a fraction
+  of a millisecond apart. The switch floods it as RutOS programmed it to,
+  and RutOS's DSA tag code then has the bridge flood it again: it marks a
+  received frame as forwarded by the hardware only if it is unicast and not
+  ARP or RARP. Nothing among the registers RutOS writes keeps the hardware
+  from flooding, so this is taken to be the firmware's doing; whether a real
+  TSW does the same has not been checked.
 * Untested: firmware upgrade (which checks the image's signature), SSH,
   anything beyond the default VLAN, the web interface past its login page,
   and a reboot from inside the firmware.
@@ -576,6 +596,16 @@ One indirection there is worth knowing about, because reading past it looks
 like it works: `L2_FLD_PMSK` does not hold port masks. It holds two nine-bit
 row numbers into the multicast port mask table, and the driver's value for them
 reads as a perfectly plausible port mask that happens to exclude the CPU port.
+
+VLANs are classified per port by the inner or the outer tag, as
+`VLAN_PORT_FWD` says, each with its own PVID in `PB_VLAN` and its own
+acceptable frame types; Linux and RutOS use the inner tag, Zyxel's firmware the
+outer one, matched against 0x8100 all the same. A frame from a port outside
+its VLAN is forwarded, dropped or trapped as `VLAN_PORT_IGR_FLTR` says for that
+port. Before any of that the MAC drops runts, shorter than 60 bytes without
+FCS, and frames longer than `MAC_MAX_LEN_CTRL` allows. The socket and dgram
+backends deliver frames as they are sent, which is how a test station can
+send a runt; slirp and tap pad short frames to the minimum first.
 
 `rtl838x_port.c` is one QEMU NIC per front-panel port, and the link state the
 guest sees through the PHY is the backend's.

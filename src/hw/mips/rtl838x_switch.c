@@ -649,6 +649,10 @@ static const MemoryRegionOps rtl838x_switch_ops = {
 /* MAC_ADDR_CTRL, MAC_ADDR_CTRL_ALE, MAC_ADDR_CTRL_MAC: high 16 bits, low 32 */
 static const hwaddr sw_mac_regs[] = { 0xa9ec, 0x6b04, 0xa320 };
 
+/* Acceptable frame types, one register a port; see rtl838x_fwd.c. */
+#define SW_VLAN_PORT_AFT        0x3a00
+#define SW_VLAN_PORT_AFT_ALL    0xf
+
 static void rtl838x_switch_reset(DeviceState *dev)
 {
     RTL838xSwitchState *s = RTL838X_SWITCH(dev);
@@ -667,6 +671,14 @@ static void rtl838x_switch_reset(DeviceState *dev)
     s->regs[SW_PLL_MEM_CTRL1 / 4] = 0x14018c80;
 
     s->regs[SW_THERMAL_RESULT / 4] = SW_THERMAL_VALID | SW_THERMAL_DEGREES;
+
+    /*
+     * Every port admits tagged and untagged frames on either tag until told
+     * otherwise.  Linux never writes these, and relies on that.
+     */
+    for (unsigned p = 0; p <= RTL838X_SW_CPU_PORT; p++) {
+        s->regs[(SW_VLAN_PORT_AFT + p * 4) / 4] = SW_VLAN_PORT_AFT_ALL;
+    }
 
     /*
      * The stock bootloader programs the switch's MAC address into the three

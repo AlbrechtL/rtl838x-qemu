@@ -27,7 +27,40 @@
 #include "qemu/log.h"
 
 #define FWD_PORT_ISO_CTRL(p)    (0x4100 + (p) * 4)
+
+/*
+ * A port classifies frames by one of two VLAN tags, the inner (customer) or
+ * the outer (service) one: VLAN_PORT_FWD has a bit per port, set for outer.
+ * Each has its own PVID in PB_VLAN and its own pair of acceptable frame type
+ * bits.  The drivers differ here: Linux and RutOS stay with the inner tag
+ * and leave this register at zero, while Zyxel's firmware switches every
+ * port to the outer one -- which it then matches against 0x8100, so it is
+ * the same tag on the wire -- and never touches an inner PVID.
+ */
+#define FWD_VLAN_PORT_FWD       0x3a78
 #define FWD_VLAN_PORT_PB_VLAN(p) (0x3c00 + (p) * 4)
+#define FWD_PB_VLAN_INNER(v)    (((v) >> 2) & 0xfff)
+#define FWD_PB_VLAN_OUTER(v)    (((v) >> 16) & 0xfff)
+
+/*
+ * Acceptable frame types, two bits for each tag: [1:0] inner, [3:2] outer.
+ * The low bit of a pair admits tagged frames, the high one untagged and
+ * priority-tagged frames.  Out of reset a port admits both (the board sets
+ * them), which is what Linux relies on: it never writes here.
+ */
+#define FWD_VLAN_PORT_AFT(p)    (0x3a00 + (p) * 4)
+#define FWD_AFT_TAGGED          1
+#define FWD_AFT_UNTAGGED        2
+
+/*
+ * Ingress filtering: what happens to a frame from a port that is not in its
+ * VLAN, two bits a port, sixteen ports a register.  Zyxel's firmware leaves
+ * it at forward unless told otherwise; Linux and RutOS drop.
+ */
+#define FWD_VLAN_PORT_IGR_FLTR(p) (0x3a7c + ((p) / 16) * 4)
+#define FWD_IGR_FORWARD         0
+#define FWD_IGR_DROP            1
+#define FWD_IGR_TRAP            2
 
 /*
  * Flooding is one level of indirection away.  L2_FLD_PMSK does not hold port
@@ -79,6 +112,15 @@
 
 /* The shortest frame Ethernet allows on the wire, without its FCS. */
 #define FWD_FRAME_MIN           60
+
+/*
+ * The longest frame a port takes, FCS included: two fourteen-bit fields, the
+ * same value in both in everything seen so far -- 1526 from Linux, 10000 from
+ * both vendor SDKs -- so the upper one stands for both.  Zero, before anyone
+ * has set it, takes anything.
+ */
+#define FWD_MAC_MAX_LEN_CTRL    0xa9e0
+#define FWD_MAC_MAX_LEN(v)      (((v) >> 14) & 0x3fff)
 
 /* Set to 1 to trace forwarding decisions, including the drops. */
 #define RTL838X_FWD_DEBUG 0
@@ -155,9 +197,30 @@ static unsigned fwd_stp_state(RTL838xSwitchState *s, unsigned port)
     return (row[1 - port / 16] >> (2 * (port % 16))) & 3;
 }
 
+static bool fwd_port_outer(RTL838xSwitchState *s, unsigned port)
+{
+    return s->regs[FWD_VLAN_PORT_FWD / 4] & (1u << port);
+}
+
 static uint16_t fwd_port_pvid(RTL838xSwitchState *s, unsigned port)
 {
-    return (s->regs[FWD_VLAN_PORT_PB_VLAN(port) / 4] >> 2) & 0xfff;
+    uint32_t pb = s->regs[FWD_VLAN_PORT_PB_VLAN(port) / 4];
+
+    return fwd_port_outer(s, port) ? FWD_PB_VLAN_OUTER(pb) : FWD_PB_VLAN_INNER(pb);
+}
+
+/* Whether the port admits a frame that is VLAN-tagged, or one that is not. */
+static bool fwd_port_admits(RTL838xSwitchState *s, unsigned port, bool vlan_tagged)
+{
+    uint32_t aft = s->regs[FWD_VLAN_PORT_AFT(port) / 4] >>
+                   (fwd_port_outer(s, port) ? 2 : 0);
+
+    return aft & (vlan_tagged ? FWD_AFT_TAGGED : FWD_AFT_UNTAGGED);
+}
+
+static unsigned fwd_port_igr_filter(RTL838xSwitchState *s, unsigned port)
+{
+    return (s->regs[FWD_VLAN_PORT_IGR_FLTR(port) / 4] >> (2 * (port % 16))) & 3;
 }
 
 /* --------------------------------------------------- forwarding database */
@@ -283,14 +346,19 @@ static bool fwd_is_arp_request(const uint8_t *buf, size_t len, bool tagged)
            lduw_be_p(buf + l2 + 6) == 1;
 }
 
-/* The VLAN a frame belongs to, and whether it arrived carrying a tag. */
+/*
+ * The VLAN a frame belongs to, whether it arrived carrying a tag, and whether
+ * that tag names a VLAN -- a priority tag does not, and counts as untagged
+ * for the acceptable frame types.
+ */
 static uint16_t fwd_classify(RTL838xSwitchState *s, unsigned port,
                              const uint8_t *buf, size_t len, bool *tagged,
-                             uint16_t *pcp)
+                             uint16_t *pcp, bool *vlan_tagged)
 {
     uint16_t tci;
 
     *tagged = false;
+    *vlan_tagged = false;
     *pcp = 0;
 
     if (len < ETH_HLEN + 4 || lduw_be_p(buf + 12) != ETH_P_VLAN) {
@@ -299,6 +367,7 @@ static uint16_t fwd_classify(RTL838xSwitchState *s, unsigned port,
 
     tci = lduw_be_p(buf + 14);
     *tagged = true;
+    *vlan_tagged = tci & 0xfff;
     *pcp = tci >> 13;
 
     /* A priority tag carries no VLAN of its own; the port's applies. */
@@ -433,9 +502,18 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
     uint16_t vid, pcp;
     uint32_t members, mask;
     unsigned state, fid;
-    bool tagged;
+    bool tagged, vlan_tagged;
 
-    if (len < ETH_HLEN || len > FWD_FRAME_MAX) {
+    uint32_t max = FWD_MAC_MAX_LEN(s->regs[FWD_MAC_MAX_LEN_CTRL / 4]);
+
+    /*
+     * What the MAC throws away before anything else looks at it: a runt,
+     * shorter than a wire allows, and a frame longer than the port takes.
+     * The backends carry no FCS, so it is counted in.
+     */
+    if (len < FWD_FRAME_MIN || len > FWD_FRAME_MAX ||
+        (max && len + ETH_FCS_LEN > max)) {
+        fwd_dbg("port %u: dropped by the MAC, %zu bytes\n", port, len);
         return;
     }
 
@@ -452,12 +530,25 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
         return;
     }
 
-    vid = fwd_classify(s, port, buf, len, &tagged, &pcp);
+    vid = fwd_classify(s, port, buf, len, &tagged, &pcp, &vlan_tagged);
+    if (!fwd_port_admits(s, port, vlan_tagged)) {
+        fwd_dbg("port %u: dropped, does not admit %s frames\n",
+                port, vlan_tagged ? "tagged" : "untagged");
+        return;
+    }
     members = fwd_vlan_members(s, vid);
     if (!(members & (1u << port))) {
-        fwd_dbg("port %u: dropped, not a member of vlan %u (members 0x%08x)\n",
-                port, vid, members);
-        return;
+        switch (fwd_port_igr_filter(s, port)) {
+        case FWD_IGR_FORWARD:
+            break;      /* filtering off: it goes where its VLAN goes */
+        case FWD_IGR_TRAP:
+            rtl838x_eth_to_cpu(s, port, FWD_REASON_TRAP, buf, len);
+            return;
+        default:
+            fwd_dbg("port %u: dropped, not a member of vlan %u (members 0x%08x)\n",
+                    port, vid, members);
+            return;
+        }
     }
 
     fid = fwd_vlan_fid(s, vid);
@@ -485,7 +576,7 @@ void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
     uint16_t vid, pcp;
     uint32_t mask;
     unsigned fid;
-    bool tagged;
+    bool tagged, vlan_tagged;
 
     if (len < ETH_HLEN || len > FWD_FRAME_MAX) {
         return;
@@ -508,7 +599,8 @@ void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
     }
 
     /* Untagged conduit traffic: the switch treats it like any other ingress. */
-    vid = fwd_classify(s, RTL838X_SW_CPU_PORT, buf, len, &tagged, &pcp);
+    vid = fwd_classify(s, RTL838X_SW_CPU_PORT, buf, len, &tagged, &pcp,
+                       &vlan_tagged);
     fid = fwd_vlan_fid(s, vid);
     if (!fwd_is_multicast(buf + ETH_ALEN)) {
         fwd_learn(s, fid, buf + ETH_ALEN, RTL838X_SW_CPU_PORT);
