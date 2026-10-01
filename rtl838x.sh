@@ -148,9 +148,15 @@ cmd_build() {
 }
 
 # The runtime image copies out/qemu in, so it is rebuilt whenever the emulator
-# is.  Docker's cache makes that nearly free when nothing changed.
+# is.  Docker's cache makes that nearly free when nothing changed.  The
+# emulator itself is rebuilt when the models or the patch are newer than it,
+# so a pull or an edit never runs against a stale binary.
 cmd_runtime_image() {
-    [ -x "$QEMU_BIN" ] || cmd_build
+    if [ ! -x "$QEMU_BIN" ] ||
+        [ -n "$(find src patches scripts/build.sh scripts/sync.sh \
+                    -newer "$QEMU_BIN" -print -quit)" ]; then
+        cmd_build
+    fi
     "$DOCKER" build -q -t "$RUNTIME" -f docker/Dockerfile.runtime . >/dev/null
 }
 
