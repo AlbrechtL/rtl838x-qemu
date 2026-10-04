@@ -7,7 +7,7 @@ scratch flash first, the way "./rtl838x.sh mkflash" does it, and the machine
 is started without -kernel.  Everything after that goes through the vendor
 CLI on the serial console and through the front-panel ports.  Run it through
 "./rtl838x.sh test-stock <image.bix>", which supplies the container.
-Teltonika's firmware is handed on to test_tsw.py.
+Teltonika's firmware is handed on to test_tsw.py, HPE's to test_hpe.py.
 """
 
 import argparse
@@ -87,6 +87,9 @@ def main():
     if image.is_tsw():
         import test_tsw
         return test_tsw.run(args)
+    if isinstance(image, imgtool.Comware):
+        import test_hpe
+        return test_hpe.run(args)
 
     flash = tempfile.NamedTemporaryFile(prefix="rtl838x-flash-", suffix=".bin")
     flash.write(imgtool.mkflash(image.data, imgtool.DEFAULT_BDINFO,
@@ -95,7 +98,9 @@ def main():
 
     # lan1 and lan2 are cables this test holds the other end of, lan3 is
     # QEMU's user network, renumbered into the switch's factory subnet and
-    # forwarding a local port to its web server.  lan4 to lan8 stay empty.
+    # forwarding a local port to its web server.  The firmware asks for an
+    # address over DHCP before it falls back to its factory one, so that is
+    # the one the user network leases it.  lan4 to lan8 stay empty.
     wires = [Wire(), Wire()]
     web = free_port()
     argv = [args.qemu, "-M", "rtl838x,flash-model=%s" % FLASH_MODEL,
@@ -104,7 +109,8 @@ def main():
     for w in wires:
         argv += ["-nic", w.nic_arg]
     argv += ["-nic", "user,model=rtl838x-port,net=192.168.1.0/24,host=%s,"
-                     "hostfwd=tcp:127.0.0.1:%d-%s:80" % (HOST_IP, web, SWITCH_IP)]
+                     "dhcpstart=%s,hostfwd=tcp:127.0.0.1:%d-%s:80"
+             % (HOST_IP, SWITCH_IP, web, SWITCH_IP)]
     print("booting: %s" % " ".join(argv))
 
     con = Console(argv, args.verbose)

@@ -63,6 +63,16 @@
 #define FWD_IGR_TRAP            2
 
 /*
+ * VLAN egress filtering is per port, a bit each: a port with its bit clear
+ * takes frames from any VLAN, member or not.  The drivers set it for the
+ * front-panel ports.  HPE's Comware leaves it clear for the CPU port, which
+ * it keeps out of every VLAN, and that is how broadcasts reach it; its DHCP
+ * client hears nothing otherwise.  Zyxel's firmware sets it there too, and
+ * Linux has the CPU port in every VLAN anyway.
+ */
+#define FWD_VLAN_PORT_EGR_FLTR  0x3a84
+
+/*
  * Flooding is one level of indirection away.  L2_FLD_PMSK does not hold port
  * masks at all: it holds two nine-bit row numbers into the multicast port mask
  * table, one for broadcast and one for unknown unicast.  Reading it as a mask
@@ -470,7 +480,8 @@ static uint32_t fwd_filter(RTL838xSwitchState *s, uint32_t mask, unsigned src)
 static uint32_t fwd_destination(RTL838xSwitchState *s, uint16_t vid,
                                 unsigned fid, const uint8_t *dst)
 {
-    uint32_t members = fwd_vlan_members(s, vid);
+    uint32_t members = fwd_vlan_members(s, vid) |
+                       ~s->regs[FWD_VLAN_PORT_EGR_FLTR / 4];
     int port;
 
     /*
@@ -571,7 +582,7 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
 }
 
 void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
-                          uint32_t dpm, bool as_dpm)
+                          uint32_t dpm, bool as_dpm, bool learn)
 {
     uint16_t vid, pcp;
     uint32_t mask;
@@ -585,15 +596,50 @@ void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
     if (as_dpm) {
         /*
          * The guest named the ports, which is how DSA reaches a specific one
-         * and how the bridge gets a BPDU out of a port it is blocking.  The
-         * frame is already in the form it wants, so it goes out untouched --
-         * no lookup, no spanning tree, no tag rewriting.
+         * and how the bridge gets a BPDU out of a port it is blocking.  No
+         * lookup, no spanning tree.  A tag still leaves where its VLAN has
+         * the port untagged: HPE's Comware hands every frame over tagged
+         * with its VLAN and has the switch strip it at an access port.
+         * Linux sends a tag only where the port is a tagged member, so for
+         * Linux the frame goes out as it was given.
          */
+        g_autofree uint8_t *untagged = NULL;
+        size_t untagged_len = 0;
+        uint32_t untag = 0;
+
+        vid = fwd_classify(s, RTL838X_SW_CPU_PORT, buf, len, &tagged, &pcp,
+                           &vlan_tagged);
+        if (vlan_tagged) {
+            untag = fwd_vlan_untagged(s, vid);
+        }
+        /*
+         * The tag can ask for the source to be learnt all the same.  The
+         * Comware SDK does, for everything but its BPDUs, and has no other
+         * way of telling the switch where its own address is: frames for it
+         * would flood the VLAN, of which the CPU port is no member.
+         */
+        if (learn && !fwd_is_multicast(buf + ETH_ALEN)) {
+            fwd_learn(s, fwd_vlan_fid(s, vid), buf + ETH_ALEN,
+                      RTL838X_SW_CPU_PORT);
+        }
         for (unsigned p = RTL838X_SW_PORT_FIRST; p <= RTL838X_SW_PORT_LAST;
              p++) {
-            if ((dpm & (1u << p)) && rtl838x_switch_link_up(s, p)) {
-                rtl838x_port_send(s->port[p - RTL838X_SW_PORT_FIRST], buf, len);
+            const uint8_t *frame = buf;
+            size_t frame_len = len;
+
+            if (!(dpm & (1u << p)) || !rtl838x_switch_link_up(s, p)) {
+                continue;
             }
+            if (untag & (1u << p)) {
+                if (!untagged) {
+                    untagged = g_malloc(MAX(len, FWD_FRAME_MIN));
+                    untagged_len = fwd_untag(buf, len, untagged);
+                }
+                frame = untagged;
+                frame_len = untagged_len;
+            }
+            rtl838x_port_send(s->port[p - RTL838X_SW_PORT_FIRST], frame,
+                              frame_len);
         }
         return;
     }

@@ -26,6 +26,7 @@ class Console:
     def __init__(self, argv, verbose=False):
         self.verbose = verbose
         self.buf = ""
+        self.log = ""       # everything, for checks over the whole run
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=0)
@@ -56,6 +57,7 @@ class Console:
                     sys.stdout.write(text)
                     sys.stdout.flush()
                 self.buf += text
+                self.log += text
 
     def send(self, line):
         self.proc.stdin.write((line + "\n").encode())

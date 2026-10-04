@@ -5,8 +5,9 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
-Zyxel's own firmware for the GS1900-8 and Teltonika's RutOS for the TSW2xx
-all run; see [Tested firmware](#tested-firmware) for exactly which.
+Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx and
+HPE's Comware for the 1920-8G all run; see [Tested firmware](#tested-firmware)
+for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
@@ -47,6 +48,9 @@ no kernel oops or unhandled faults       PASS
   * [What mkflash writes](#what-mkflash-writes)
   * [What RutOS needed](#what-rutos-needed)
   * [What RutOS lacks](#what-rutos-lacks)
+* [HPE firmware](#hpe-firmware)
+  * [What Comware needed](#what-comware-needed)
+  * [What Comware lacks](#what-comware-lacks)
 * [How the image boots](#how-the-image-boots)
 * [What is modelled](#what-is-modelled)
 * [How the data path works](#how-the-data-path-works)
@@ -64,9 +68,11 @@ no kernel oops or unhandled faults       PASS
 | Ethernet Switch OS | an RTL8382MI board | RTL8382MI | In the emulator |
 | Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Zyxel firmware](#zyxel-firmware) |
 | Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
+| HPE Comware 5.20.99 Release 1121, `1920-8G-JG920A_5.20.R1121.zip` | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
-and has the GS1900-8's eight ports and 16 MiB flash. Images for other RTL838x
+and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
+firmware, which makes it a 1920-8G with a 32 MiB flash. Images for other RTL838x
 boards may work as well, as long as their device tree asks for nothing more;
 the TSW2xx's two SFP cages are there only as far as its device tree says so,
 and are empty.
@@ -237,14 +243,16 @@ Port  Name                 Status      Vlan  Duplex  Speed    Type
 ...
 ```
 
-The account is the factory one, `admin` / `1234`, and the address the factory
-one too, 192.168.1.1. QEMU's user network can be renumbered to match, which
-makes the host 192.168.1.2 from the switch's side and puts the web interface
-on <http://localhost:8080> once the console says `Press any key to continue`:
+The account is the factory one, `admin` / `1234`. The firmware asks for an
+address over DHCP first and falls back to the factory one, 192.168.1.1, so
+QEMU's user network can be renumbered to match and lease it that very
+address. That makes the host 192.168.1.2 from the switch's side and puts the
+web interface on <http://localhost:8080> once the console says
+`Press any key to continue`:
 
 ```sh
 ./rtl838x.sh run-flash flash.bin -machine flash-model=mx25l12805d \
-    -nic user,net=192.168.1.0/24,host=192.168.1.2,hostfwd=tcp::8080-192.168.1.1:80
+    -nic user,net=192.168.1.0/24,host=192.168.1.2,dhcpstart=192.168.1.1,hostfwd=tcp::8080-192.168.1.1:80
 ```
 
 ```
@@ -495,6 +503,152 @@ pass as before.
   anything beyond the default VLAN, the web interface past its login page,
   and a reboot from inside the firmware.
 
+## HPE firmware
+
+HPE's 1920 series runs Comware 5.20, which is not Linux: H3C's own real-time
+kernel, with a Linux 2.6.16 ("BLINUX") hosted as one of its tasks and
+Realtek's SDK 2.1 compiled in. The 1920-8G is an RTL8380M with the eight
+copper ports, two SFP cages behind the SoC's SerDes, and a 32 MiB flash.
+
+The firmware is not in this repository. Tested is 5.20.99 Release 1121 for
+the JG920A, `1920-8G-JG920A_5.20.R1121.zip`; the zip can be used as it is.
+The other six 1920 models' images of the same release unpack the same way,
+but only the 1920-8G's has been booted.
+
+On the switch, BootWare, HPE's bootloader, loads `main.bin` from Comware's
+file system on the flash. This machine has no BootWare, so it does with the
+firmware file what BootWare would: given to `-kernel`, it is recognised,
+its application unpacked from the 7-Zip archive inside it to `0x80100000`
+and started, and the machine is built as a 1920-8G. `run-flash` takes the
+firmware after the flash for that:
+
+```sh
+./rtl838x.sh mkflash images/1920-8G-JG920A_5.20.R1121.zip hpe.bin
+./rtl838x.sh run-flash hpe.bin images/1920-8G-JG920A_5.20.R1121.zip \
+    -nic user,hostfwd=tcp::8080-:80
+```
+
+`mkflash` writes a 32 MiB flash that is erased but for the manufacturing
+record in its last sector, which holds the MAC address
+(`--mnfinfo mac=...`, `02:E0:4C:83:80:01` unless changed); without it every
+switch is `00e0-fc00-3620`. The console offers a login after about two
+minutes:
+
+```
+Press ENTER to get started.
+Login authentication
+Username:admin
+Password:
+<HPE>summary
+...
+Mac address: 02e0-4c83-8001
+Current boot app is: flash:/main.bin
+HPE Comware Platform Software
+Comware Software, Version 5.20.99, Release 1121
+...
+HPE 1920-8G Switch
+128M    bytes DRAM
+32M     bytes Flash Memory
+[SubSlot 0] 8GE+2SFP Hardware Version is Ver.A
+```
+
+The account is `admin` with no password. The 1920's CLI is cut down to a
+handful of commands; `_cmdline-mode on`, with the password
+`Jinhua1920unauthorized`, unlocks the rest. The factory settings give VLAN 1
+no address, `ipsetup` does:
+
+```
+<HPE>ipsetup ip-address 10.0.2.15 24 default-gateway 10.0.2.2
+<HPE>ping 10.0.2.2
+    Reply from 10.0.2.2: bytes=56 Sequence=1 ttl=255 time=7 ms
+```
+
+after which the web interface is on <http://localhost:8080>. The flash comes
+erased and Comware does not format it by itself: `format flash:` in the full
+CLI, then `save`, and the configuration survives a restart. Comware's own
+`reboot` refuses, as `flash:/main.bin` does not exist; `system_reset` in the
+QEMU monitor is the power switch.
+
+```
+$ ./rtl838x.sh test-stock images/1920-8G-JG920A_5.20.R1121.zip
+the machine unpacks the application      PASS
+Comware recognises its flash             PASS
+logs in with the factory account         PASS
+summary names the switch and firmware    PASS
+the MAC address comes from the flash     PASS
+the full CLI unlocks                     PASS
+the three cabled ports are up at 1 Gbps  PASS
+the empty ports and SFP cages are down   PASS
+the switch pings a host on port 3        PASS
+port 1 to port 2 is switched in hardware PASS
+a frame is not reflected to its source   PASS
+the web interface answers                PASS
+the configuration is saved to flash      PASS
+it survives a power cycle                PASS
+no SDK failures or dead loops            PASS
+```
+
+### What Comware needed
+
+* **A stack.** Its entry stub stores to the stack first thing, and the CPU
+  came out of reset with `sp` at zero. The machine now leaves one 1 MiB below
+  the top of RAM, as a bootloader would.
+* **The flash it knows, at 32 MiB.** A table of 24 JEDEC IDs, and a chip it
+  does not find parks the boot in a `j .` with no output. It keeps records
+  at the very end of a 32 MiB chip, so it is an MX25L25635E, which the
+  machine picks itself for HPE's firmware.
+* **The flash's memory-mapped window.** Comware reads the flash through the
+  SPI controller's window at `0xb4000000`, 32 MiB of it, which the machine
+  now has; each load becomes a read on the SPI bus, so the window sees what
+  the guest wrote.
+* **The four-byte-address strap.** Bit 29 of `0xbb00100c` tells Comware to
+  address the flash with four bytes.
+  Without it the upper 16 MiB wrapped onto the lower and the file system
+  could not be written.
+* **A SoC revision.** Bits 5:1 of `0xbb000ff0` at zero mean a first-cut chip
+  whose second timer counts at `0x310c`. Comware then used Otto timer 0's
+  interrupt register as its cycle counter, which never moves, and printed
+  `ERROR:divide must not be zero!` some 150,000 times during boot while
+  computing CPU usage.
+* **The SerDes strap.** `INT_MODE_CTRL` says what is behind ports 24 and 26;
+  the SDK counts them as ports only when it says fibre, and complained about
+  spanning tree on both SFP ports for every instance until it did.
+* **Tagged frames from the CPU lose their tag at an access port.** Comware
+  hands every frame to the switch tagged with its VLAN and a port mask, and
+  has the hardware strip the tag where the VLAN has the port untagged.
+* **"Learn this source."** Bit 3 of the transmit tag's second word has the
+  switch learn the frame's source address on the CPU port. It is how the
+  switch finds out where Comware's own address is; nothing came back to it
+  before.
+* **Per-port VLAN egress filtering.** Comware keeps the CPU port out of every
+  VLAN and leaves its egress filter off in `VLAN_PORT_EGR_FLTR`, so flooded
+  frames may reach it all the same. The model now honours the register. The
+  Zyxel firmware's DHCP client runs before it sets the bit for the CPU port,
+  and now gets a lease too, as it would on a real switch.
+* **ACL rule moves complete.** Configuring an address moves ACL rules; the
+  SDK waits on bit 0 of `0x6160` forever, which Comware's watchdog reports as
+  a dead loop in the console task.
+
+OpenWrt, the Zyxel and the Teltonika firmware pass their tests as before.
+
+### What Comware lacks
+
+* No BootWare: the flash cannot boot by itself, `reboot` refuses, firmware
+  upgrade has nothing to upgrade, and `summary` reports the Bootrom version
+  as `000`.
+* Broadcasts from the ports do not reach Comware. It has the switch trap ARP
+  and DHCP to the CPU with ACL rules, and the machine models no ACLs. It
+  resolves addresses itself, so it reaches a host and is reached back once
+  it has spoken first, as `ping` does and as `ipsetup` does with its
+  gratuitous ARP; a host that ARPs for it before that gets no answer, and
+  DHCP (`ipsetup dhcp` and the automatic configuration at first boot) does
+  not get a lease.
+* The rest of the manufacturing record is empty: no serial number, and the
+  device's other identity Comware fills in with its defaults.
+* Untested: the SFP ports with anything in them (the cages are always empty),
+  PoE models, SSH, SNMP, anything past the web interface's login page, and
+  every 1920 model but the 1920-8G.
+
 ## How the image boots
 
 `images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
@@ -528,7 +682,7 @@ time by `scripts/sync.sh`.
 | Interrupt controller | `0x18003000` | 32 sources onto 5 outputs, wired to MIPS IP2..IP6 |
 | Otto timer | `0x18003100` | Five count-up timers; clocksource *and* clockevent |
 | Memory controller | `0x18001000` | Reports 128 MiB to both rt-loader and the kernel |
-| SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash) |
+| SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash); memory-mapped at `0x14000000` |
 | UART | `0x18002000` | 16550, reg-shift 2 |
 | Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
 | GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx |
@@ -629,10 +783,11 @@ guest sees through the PHY is the backend's.
   rate limiting, so anything measuring bandwidth or priority measures the host.
 * The RTL8231 GPIO expander on the bit-banged MDIO bus is absent, so the reset
   button and the system LED do not exist.
-* The flash has no memory-mapped window, which only the stock bootloader
-  reads through, and the machine loads only the first image slot, at
-  `0x260000` or `0xa0000`; `bootpartition` in the U-Boot environment is not
-  consulted.
+* The machine loads only the first image slot, at `0x260000` or `0xa0000`;
+  `bootpartition` in the U-Boot environment is not consulted. HPE's
+  BootWare is not emulated at all.
+* There are no ACLs: the rules are stored, but nothing matches against them,
+  so nothing is trapped, redirected or dropped by one.
 * Migration saves the register window, the PHYs and the ring cursors, but not
   the table engine's contents or the forwarding database, so a restored machine
   forgets what it had learned.
@@ -655,6 +810,7 @@ tests/test_stock.py the same for the Zyxel firmware, from a scratch flash and
                     through the vendor CLI
 tests/test_tsw.py   the same for the Teltonika firmware, which test_stock.py
                     hands it
+tests/test_hpe.py   the same for HPE's firmware, which test_stock.py hands it
 qemu/               submodule, pinned to v11.1.1
 ```
 

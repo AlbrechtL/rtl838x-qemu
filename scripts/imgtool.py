@@ -17,15 +17,23 @@ Teltonika's RutOS for the TSW2xx is an OpenWrt sysupgrade image: a uImage
 with the standard magic around an LZMA kernel (device tree appended, no
 rt-loader), then the squashfs root filesystem, then a signature trailer.
 
+HPE's Comware for the 1920 series is no uImage at all: a table of segments,
+BootWare's two halves and the application, each behind a 0x154-byte header,
+the application a 7-Zip archive around one LZMA-compressed raw image for
+0x80100000.  The machine boots the file as it is, given to -kernel.
+
     info           dump the uImage header, locate rt-loader and the LZMA blob
     extract-kernel decompress the kernel (for the loader-bypass boot path)
     dtb            extract the appended device tree blob
     dts            pretty-print the appended device tree
+    unzip          write out the firmware file inside a vendor's zip
     mkflash        build a 16 MiB flash image with the firmware installed and
-                   the two U-Boot environments the vendor firmware reads
+                   the two U-Boot environments the vendor firmware reads; for
+                   HPE's firmware, a 32 MiB flash with a MAC address in it
 """
 
 import argparse
+import binascii
 import lzma
 import re
 import struct
@@ -106,6 +114,27 @@ LOADER_STUB = b"U-Boot 0.0-svn0 (Jan 01 2000 - 00:00:00)\0"
 
 COMPRESSION = {0: "none", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo", 5: "lz4", 6: "zstd"}
 
+# HPE's Comware: the segment table, and the application's type in it.
+CMW_SEG_TABLE = 0x20
+CMW_SEG_ENTRY_SIZE = 0x18
+CMW_SEG_HEADER_SIZE = 0x154
+CMW_SEG_NAMES = {0x05000001: "BootWare (basic)", 0x05000000: "BootWare (extended)",
+                 0x04000000: "application"}
+CMW_SEG_APP = 0x04000000
+SEVENZIP_SIG = b"7z\xbc\xaf\x27\x1c"
+
+# The HPE 1920's flash: 32 MiB, Comware's file system from 0x300000, and in
+# the last sector the manufacturing record Comware takes its MAC address
+# from.  The record is a CRC-16 (XMODEM) of the 0x3c2 bytes behind it, then
+# those bytes, with the MAC 0x68 bytes from the start.  Without a valid one every switch has
+# Comware's default address, 00e0-fc00-3620.  The rest of the record is left
+# zero: Comware's own defaults, and nothing in it is a dump of a real unit.
+HPE_FLASH_SIZE = 32 * 1024 * 1024
+HPE_MNFINFO = 0x1ff0000
+HPE_MNFINFO_LEN = 0x3c2
+HPE_MNFINFO_MAC = 0x68
+DEFAULT_HPE_MNFINFO = {"mac": "02:E0:4C:83:80:01"}
+
 
 class Image:
     def __init__(self, data):
@@ -180,6 +209,107 @@ class Image:
             return False
 
 
+def sevenzip_number(buf, pos):
+    """7-Zip's variable-length number at buf[pos]; returns (value, next pos)."""
+    first, pos = buf[pos], pos + 1
+    value = 0
+    for i in range(8):
+        mask = 0x80 >> i
+        if not first & mask:
+            return value | ((first & (mask - 1)) << (8 * i)), pos
+        value |= buf[pos] << (8 * i)
+        pos += 1
+    return value, pos
+
+
+def unpack_7z(arc):
+    """The one file of a Comware 7-Zip archive: one LZMA coder, plain header.
+
+    This is as much of the format as Comware's archives use, the same subset
+    the machine reads (rtl838x.c), and anything else is refused.
+    """
+    if arc[:6] != SEVENZIP_SIG:
+        raise ValueError("not a 7-Zip archive")
+    next_off, next_len = struct.unpack("<QQ", arc[12:28])
+    hdr = arc[32 + next_off:32 + next_off + next_len]
+
+    def expect(pos, *ids):
+        for i in ids:
+            if hdr[pos] != i:
+                raise ValueError("unsupported 7-Zip header")
+            pos += 1
+        return pos
+
+    pos = expect(0, 0x01, 0x04, 0x06)            # header, streams, pack info
+    pack_pos, pos = sevenzip_number(hdr, pos)
+    count, pos = sevenzip_number(hdr, pos)
+    pos = expect(pos, 0x09)                      # sizes
+    pack_len, pos = sevenzip_number(hdr, pos)
+    if count != 1:
+        raise ValueError("unsupported 7-Zip header")
+    if hdr[pos] == 0x0a:                         # CRCs, all defined
+        pos = expect(pos + 1, 0x01) + 4
+    pos = expect(pos, 0x00, 0x07, 0x0b)          # end, unpack info, folder
+    folders, pos = sevenzip_number(hdr, pos)
+    pos = expect(pos, 0x00)                      # not external
+    coders, pos = sevenzip_number(hdr, pos)
+    pos = expect(pos, 0x23, 0x03, 0x01, 0x01)    # LZMA, with properties
+    nprops, pos = sevenzip_number(hdr, pos)
+    if folders != 1 or coders != 1 or nprops != 5:
+        raise ValueError("unsupported 7-Zip header")
+    props, pos = hdr[pos:pos + 5], pos + 5
+    pos = expect(pos, 0x0c)                      # unpacked size
+    size, pos = sevenzip_number(hdr, pos)
+
+    alone = props + struct.pack("<Q", size) + arc[32 + pack_pos:32 + pack_pos + pack_len]
+    return lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(alone)
+
+
+class Comware:
+    """HPE's Comware firmware: its segment table, and the application."""
+
+    def __init__(self, data):
+        self.data = data
+        self.segments = []
+        count = struct.unpack(">I", data[4:8])[0] if len(data) >= 8 else 0
+        if not 0 < count <= 8:
+            raise ValueError("not a Comware image")
+        for i in range(count):
+            off = CMW_SEG_TABLE + i * CMW_SEG_ENTRY_SIZE
+            kind, start, size = struct.unpack(">III", data[off:off + 12])
+            if start + size > len(data) or size < CMW_SEG_HEADER_SIZE:
+                raise ValueError("not a Comware image")
+            self.segments.append((kind, start, size))
+        app = [s for s in self.segments if s[0] == CMW_SEG_APP]
+        if len(app) != 1 or self.archive()[:6] != SEVENZIP_SIG:
+            raise ValueError("not a Comware image")
+
+    def archive(self):
+        _, start, size = [s for s in self.segments if s[0] == CMW_SEG_APP][0]
+        return self.data[start + CMW_SEG_HEADER_SIZE:start + size]
+
+    def kernel(self):
+        """The application, unpacked: a raw image for 0x80100000."""
+        return unpack_7z(self.archive())
+
+    def is_tsw(self):
+        return False
+
+
+def mkflash_hpe(mnfinfo):
+    """An HPE 1920's flash: erased, but for the manufacturing record."""
+    flash = bytearray(b"\xff" * HPE_FLASH_SIZE)
+    record = bytearray(2 + HPE_MNFINFO_LEN)
+    for name, value in mnfinfo.items():
+        if name != "mac":
+            raise ValueError(f"unknown manufacturing field {name!r}")
+        mac = bytes.fromhex(value.replace(":", "").replace("-", ""))
+        record[HPE_MNFINFO_MAC:HPE_MNFINFO_MAC + 6] = mac
+    record[0:2] = struct.pack(">H", binascii.crc_hqx(bytes(record[2:]), 0))
+    flash[HPE_MNFINFO:HPE_MNFINFO + len(record)] = record
+    return bytes(flash)
+
+
 def fdt_to_dts(dtb):
     (_, _, off_st, off_str, _, _, _, _, size_str,
      size_st) = struct.unpack(">10I", dtb[:40])
@@ -219,16 +349,31 @@ def fdt_to_dts(dtb):
     return "\n".join(out) + "\n"
 
 
-def load(path):
-    """The image in a file, or the .bix inside a vendor download's zip."""
+def firmware(path):
+    """The bytes of a firmware file, or of the .bix or .bin in a vendor's zip."""
     data = open(path, "rb").read()
     if zipfile.is_zipfile(io.BytesIO(data)):
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            names = [n for n in z.namelist() if n.lower().endswith(".bix")]
+            names = [n for n in z.namelist()
+                     if n.lower().endswith((".bix", ".bin"))]
             if len(names) != 1:
-                raise ValueError(f"expected one .bix in {path}, found {names}")
+                raise ValueError(f"expected one .bix or .bin in {path}, "
+                                 f"found {names}")
             data = z.read(names[0])
-    return Image(data)
+    return data
+
+
+def load(path):
+    """The image in a file, or the .bix or .bin inside a vendor's zip."""
+    data = firmware(path)
+    try:
+        return Image(data)
+    except ValueError:
+        try:
+            return Comware(data)
+        except (ValueError, IndexError, struct.error):
+            pass
+        raise
 
 
 def uboot_env(variables):
@@ -270,7 +415,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["info", "extract-kernel", "dtb", "dts",
-                                        "mkflash"])
+                                        "unzip", "mkflash"])
     ap.add_argument("image")
     ap.add_argument("-o", "--output")
     ap.add_argument("--bdinfo", action="append", default=[], metavar="NAME=VALUE",
@@ -279,15 +424,27 @@ def main():
                     help="mkflash: set a variable in the second environment")
     ap.add_argument("--mnfinfo", action="append", default=[], metavar="NAME=VALUE",
                     help="mkflash, TSW2xx: set a manufacturing field "
-                         "(mac, name, serial, batch, hwver)")
+                         "(mac, name, serial, batch, hwver); HPE: mac")
     args = ap.parse_args()
+
+    if args.command == "unzip":
+        if not args.output:
+            ap.error("unzip needs -o")
+        data = firmware(args.image)
+        open(args.output, "wb").write(data)
+        print(f"wrote {len(data)} bytes to {args.output}", file=sys.stderr)
+        return
 
     img = load(args.image)
 
     if args.command == "mkflash":
         if not args.output:
             ap.error("mkflash needs -o")
-        if img.is_tsw():
+        if isinstance(img, Comware):
+            mnfinfo = dict(DEFAULT_HPE_MNFINFO)
+            mnfinfo.update(v.split("=", 1) for v in args.mnfinfo)
+            flash = mkflash_hpe(mnfinfo)
+        elif img.is_tsw():
             env, mnfinfo = dict(DEFAULT_TSW_UBOOT_ENV), dict(DEFAULT_TSW_MNFINFO)
             env.update(v.split("=", 1) for v in args.bdinfo)
             mnfinfo.update(v.split("=", 1) for v in args.mnfinfo)
@@ -299,8 +456,26 @@ def main():
                 env.update(v.split("=", 1) for v in given)
             flash = mkflash(img.data, bdinfo, sysinfo)
         open(args.output, "wb").write(flash)
-        print(f"wrote {FLASH_SIZE} bytes to {args.output}", file=sys.stderr)
+        print(f"wrote {len(flash)} bytes to {args.output}", file=sys.stderr)
         return
+
+    if isinstance(img, Comware):
+        if args.command == "info":
+            print("HPE Comware image")
+            for kind, start, size in img.segments:
+                name = CMW_SEG_NAMES.get(kind, f"type 0x{kind:08x}")
+                print(f"  0x{start:08x} {size:9d} bytes  {name}")
+            k = img.kernel()
+            print(f"application {len(k)} bytes unpacked, loads at 0x80100000")
+            # Every model's strings are in every image; the release is the
+            # one a model's name follows.
+            m = re.search(rb"(\d+\.\d+\.\d+ Release \d+)\0+(?:[^\0]+\0+)?"
+                          rb"[^\0]+ Switch\0", k)
+            if m:
+                print(f"            Comware {m.group(1).decode()}")
+            return
+        if args.command != "extract-kernel":
+            ap.error(f"{args.command}: a Comware image has no device tree")
 
     if args.command == "info":
         vendor = " (vendor magic)" if img.magic == RTL_MAGIC else ""
@@ -328,9 +503,9 @@ def main():
                 print(f"            {m.group().decode('ascii', 'replace')}")
         return
 
-    blob = {"extract-kernel": img.kernel, "dtb": img.dtb}.get(args.command)
+    blob = {"extract-kernel": "kernel", "dtb": "dtb"}.get(args.command)
     if blob:
-        data = blob()
+        data = getattr(img, blob)()
         if args.output:
             open(args.output, "wb").write(data)
             print(f"wrote {len(data)} bytes to {args.output}", file=sys.stderr)

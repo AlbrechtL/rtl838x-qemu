@@ -97,6 +97,7 @@
 
 /* CPU tag fields the driver puts there (transmit) and reads back (receive). */
 #define TAG_TX_MARKER           (1u << 10)  /* in word 1 */
+#define TAG_TX_L2_LEARN         (1u << 3)   /* in word 1: learn the source */
 /*
  * Word 1's top byte on receive: the tag's protocol, 4 for the RTL8380's, as an
  * in-band CPU tag carries it right after its EtherType.  Linux only looks at
@@ -181,7 +182,7 @@ static bool rtl838x_eth_tx_frame(RTL838xSwitchState *s, unsigned ring,
                                  uint32_t base)
 {
     g_autofree uint8_t *frame = NULL;
-    bool as_dpm = false, more = true;
+    bool as_dpm = false, learn = false, more = true;
     unsigned frags = 0;
     uint32_t dpm = 0;
     size_t len = 0;
@@ -216,6 +217,7 @@ static bool rtl838x_eth_tx_frame(RTL838xSwitchState *s, unsigned ring,
              * leave a port that spanning tree is otherwise blocking.
              */
             if (eth_lduw(frag + FRAG_CPU_TAG + 1 * 2) & TAG_TX_MARKER) {
+                learn = eth_lduw(frag + FRAG_CPU_TAG + 1 * 2) & TAG_TX_L2_LEARN;
                 as_dpm = eth_lduw(frag + FRAG_CPU_TAG + 2 * 2) & TAG_TX_AS_DPM;
                 dpm = (uint32_t)eth_lduw(frag + FRAG_CPU_TAG + 4 * 2) << 16 |
                       eth_lduw(frag + FRAG_CPU_TAG + 5 * 2);
@@ -260,7 +262,7 @@ static bool rtl838x_eth_tx_frame(RTL838xSwitchState *s, unsigned ring,
 
     eth_dbg("tx ring %u: %zu bytes, dpm 0x%08x%s\n", ring, len,
             dpm, as_dpm ? "" : " (no tag)");
-    rtl838x_fwd_from_cpu(s, frame, len, dpm, as_dpm);
+    rtl838x_fwd_from_cpu(s, frame, len, dpm, as_dpm, learn);
 
     return true;
 }

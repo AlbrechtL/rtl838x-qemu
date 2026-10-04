@@ -19,10 +19,21 @@
  *
  * The flash is QEMU's m25p80 model of a Macronix MX25L12855E, 16 MiB with
  * 64 KiB sectors, the geometry the GS1900's partition map is laid out for,
- * unless the machine's flash-model property names another chip.
- * Its contents come from "-drive if=mtd", which must be exactly 16 MiB;
- * without one the flash starts erased and forgets everything when QEMU
- * exits.
+ * or the 32 MiB MX25L25635E of an HPE 1920, unless the machine's
+ * flash-model property names another chip.  Its contents come from
+ * "-drive if=mtd", which must be exactly the chip's size; without one the
+ * flash starts erased and forgets everything when QEMU exits.
+ *
+ * The controller also maps the flash into the address space, 32 MiB of it
+ * at 0x14000000 (0xb4000000 through KSEG1), and turns each load from that
+ * window into a read on the bus.  Linux never uses it; HPE's Comware reads
+ * its BootWare data and its file system through it, from a 32 MiB chip.
+ * Going through the bus rather than the backing file means the window sees
+ * whatever the guest has written.  The read always carries a four-byte
+ * address, which a 32 MiB chip needs for its upper half and takes whether
+ * or not the guest has switched it to four-byte mode; a 16 MiB chip wraps
+ * it, so it repeats through the upper half as it does on the hardware,
+ * which drops the top bits of a three-byte address.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -57,10 +68,15 @@
 #define RTL838X_SPI_SFCSR_LEN_SHIFT 28      /* bytes per SFDR access - 1 */
 #define RTL838X_SPI_SFCSR_RDY   (1u << 27)
 
+#define SPI_NOR_OP_READ4        0x13
+
+#define RTL838X_FLASH_WINDOW_SIZE (32 * 1024 * 1024)
+
 struct RTL838xSocMiscState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    MemoryRegion flash_window;
     SSIBus *spi;
     qemu_irq spi_cs;
     uint32_t regs[RTL838X_SOCMISC_SIZE / 4];
@@ -132,6 +148,58 @@ static void rtl838x_socmisc_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
+/*
+ * A load from the flash window: one read transaction for the bytes it
+ * covers, most significant first, as the bus is big-endian.  A register
+ * transfer still holding the chip selected is cut short by it; nothing has
+ * been seen to do that, so it is only logged.
+ */
+static uint64_t rtl838x_flash_window_read(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    RTL838xSocMiscState *s = opaque;
+    bool selected = !(s->regs[RTL838X_SPI_SFCSR / 4] & RTL838X_SPI_SFCSR_CSB0);
+    uint64_t val = 0;
+
+    if (selected) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: flash window read at 0x%"
+                      HWADDR_PRIx " while chip select 0 is asserted\n",
+                      __func__, addr);
+        qemu_set_irq(s->spi_cs, 1);
+    }
+    qemu_set_irq(s->spi_cs, 0);
+    ssi_transfer(s->spi, SPI_NOR_OP_READ4);
+    ssi_transfer(s->spi, (addr >> 24) & 0xff);
+    ssi_transfer(s->spi, (addr >> 16) & 0xff);
+    ssi_transfer(s->spi, (addr >> 8) & 0xff);
+    ssi_transfer(s->spi, addr & 0xff);
+    for (unsigned i = 0; i < size; i++) {
+        val = (val << 8) | (ssi_transfer(s->spi, 0) & 0xff);
+    }
+    qemu_set_irq(s->spi_cs, 1);
+    if (selected) {
+        qemu_set_irq(s->spi_cs, 0);
+    }
+    return val;
+}
+
+static void rtl838x_flash_window_write(void *opaque, hwaddr addr,
+                                       uint64_t val, unsigned size)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: write to the read-only flash window "
+                  "at 0x%" HWADDR_PRIx "\n", __func__, addr);
+}
+
+static const MemoryRegionOps rtl838x_flash_window_ops = {
+    .read = rtl838x_flash_window_read,
+    .write = rtl838x_flash_window_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
 static const MemoryRegionOps rtl838x_socmisc_ops = {
     .read = rtl838x_socmisc_read,
     .write = rtl838x_socmisc_write,
@@ -160,6 +228,9 @@ static void rtl838x_socmisc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rtl838x_socmisc_ops, s,
                           TYPE_RTL838X_SOCMISC, RTL838X_SOCMISC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    memory_region_init_io(&s->flash_window, obj, &rtl838x_flash_window_ops, s,
+                          "rtl838x.flash-window", RTL838X_FLASH_WINDOW_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->flash_window);
 
     s->spi = ssi_create_bus(DEVICE(obj), "spi");
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->spi_cs);

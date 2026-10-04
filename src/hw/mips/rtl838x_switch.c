@@ -58,6 +58,17 @@
 #define SW_PLL_CML_CTRL         0x0ff8
 
 /*
+ * Pin straps, which the board decides; see the properties at the end.
+ * INT_MODE_CTRL says what is behind the two SerDes, ports 24 and 26, three
+ * bits each from bit 0; 1 is a fibre port, which is what the Realtek SDK
+ * looks for before it counts the port as there.  STRAP_DBG bit 29 has the
+ * SPI flash addressed with four bytes, as a chip larger than 16 MiB must be.
+ */
+#define SW_INT_MODE_CTRL        0x005c
+#define SW_STRAP_DBG            0x100c
+#define SW_STRAP_DBG_FLASH_4B   (1u << 29)
+
+/*
  * MODEL_NAME_INFO decodes as id = [31:16] and a suffix letter
  * 'A' + [15:11] - 1, so 0x8380 with 13 spells "RTL8380M".
  */
@@ -80,6 +91,16 @@
 #define SW_PLL_MEM_CTRL1        0x0fe0
 
 /*
+ * HPE's Comware reads a revision from bits 5:1 of this register and takes
+ * zero for a chip whose timers are laid out the older Realtek way, with the
+ * second timer's count at 0x310c.  It then uses Otto timer 0's interrupt
+ * register as its cycle counter, which never moves, and divides by the
+ * difference.  Nothing else reads it.
+ */
+#define SW_SOC_REVISION         0x0ff0
+#define SW_SOC_REVISION_VALUE   (1u << 1)
+
+/*
  * Thermal sensor.  The result register must not read as all-ones: that means
  * valid plus 127 degrees, which trips the device tree's 105 degree critical
  * point and powers the machine off about a second into boot.
@@ -95,6 +116,12 @@
 #define SW_RST_GLB_NIC          0x0000000c  /* of those, the two the NIC uses */
 #define SW_ACL_CLR_CTRL         0x6168
 #define SW_ACL_CLR_EXEC         (1u << 0)
+/*
+ * Moving a block of ACL rules, which HPE's Comware does when an address is
+ * configured.  ACLs are not modelled, so the rules stay where they are.
+ */
+#define SW_ACL_MV_CTRL          0x6160
+#define SW_ACL_MV_EXEC          (1u << 0)
 #define SW_L2_TBL_FLUSH_CTRL    0x3370
 #define SW_L2_TBL_FLUSH_EXEC    (1u << 26)
 #define SW_L2_TBL_FLUSH_BY_PORT (1u << 23)
@@ -567,6 +594,10 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
         s->regs[addr / 4] = val & ~SW_ACL_CLR_EXEC;
         return;
 
+    case SW_ACL_MV_CTRL:
+        s->regs[addr / 4] = val & ~SW_ACL_MV_EXEC;
+        return;
+
     case SW_IND_ACCESS_CTRL:
         s->regs[addr / 4] = val & ~SW_IND_ACCESS_EXEC;
         return;
@@ -669,6 +700,10 @@ static void rtl838x_switch_reset(DeviceState *dev)
     s->regs[SW_PLL_LXB_CTRL1 / 4] = 0x001ad30e;
     s->regs[SW_PLL_MEM_CTRL0 / 4] = 0x000041bc;
     s->regs[SW_PLL_MEM_CTRL1 / 4] = 0x14018c80;
+    s->regs[SW_SOC_REVISION / 4] = SW_SOC_REVISION_VALUE;
+
+    s->regs[SW_INT_MODE_CTRL / 4] = s->int_mode_ctrl;
+    s->regs[SW_STRAP_DBG / 4] = s->flash_4byte ? SW_STRAP_DBG_FLASH_4B : 0;
 
     s->regs[SW_THERMAL_RESULT / 4] = SW_THERMAL_VALID | SW_THERMAL_DEGREES;
 
@@ -807,6 +842,8 @@ static const VMStateDescription vmstate_rtl838x_switch = {
 
 static const Property rtl838x_switch_properties[] = {
     DEFINE_PROP_MACADDR("macaddr", RTL838xSwitchState, macaddr),
+    DEFINE_PROP_UINT32("int-mode-ctrl", RTL838xSwitchState, int_mode_ctrl, 0),
+    DEFINE_PROP_BOOL("flash-4byte", RTL838xSwitchState, flash_4byte, false),
 };
 
 static void rtl838x_switch_class_init(ObjectClass *oc, const void *data)

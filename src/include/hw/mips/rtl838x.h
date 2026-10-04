@@ -50,9 +50,12 @@
  * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts.
  */
 #define RTL838X_FLASH_TYPE      "mx25l12855e"
+#define RTL838X_FLASH_TYPE_HPE  "mx25l25635e"   /* 32 MiB, the HPE 1920's */
 #define RTL838X_FLASH_SIZE      (16 * 1024 * 1024)
 #define RTL838X_FLASH_FIRMWARE  0x260000
 #define RTL838X_FLASH_FIRMWARE_TSW 0x0a0000
+/* The SPI controller's window onto the flash, 0xb4000000 through KSEG1. */
+#define RTL838X_FLASH_WINDOW    0x14000000
 
 /* SoC interrupt numbers, as used by the device tree. */
 #define RTL838X_IRQ_TIMER4      15
@@ -175,6 +178,10 @@ struct RTL838xSwitchState {
     /* The switch's own address, as the bootloader leaves it programmed. */
     MACAddr macaddr;
 
+    /* Pin straps: what is behind the SerDes, how the flash is addressed. */
+    uint32_t int_mode_ctrl;
+    bool flash_4byte;
+
     uint32_t *table[RTL838X_SW_TABLE_WINDOWS][RTL838X_SW_TABLES_PER_WINDOW];
 
     /* Front-panel ports, indexed from RTL838X_SW_PORT_FIRST. */
@@ -218,6 +225,6 @@ void rtl838x_fwd_flush(RTL838xSwitchState *s, int port);
 void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
                          const uint8_t *buf, size_t len);
 void rtl838x_fwd_from_cpu(RTL838xSwitchState *s, const uint8_t *buf, size_t len,
-                          uint32_t dpm, bool as_dpm);
+                          uint32_t dpm, bool as_dpm, bool learn);
 
 #endif /* HW_MIPS_RTL838X_H */

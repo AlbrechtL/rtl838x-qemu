@@ -63,6 +63,8 @@ with_host_network() {
 # Work out where a firmware image lives and how the container can reach it.
 # Anything inside the repository is already under the /work mount; anything
 # else gets its own read-only mount, so images can be kept wherever suits.
+# A second argument names the directory it is mounted under, for when two
+# images are.
 resolve_image() {
     case $1 in
         /*) abs=$1 ;;
@@ -79,8 +81,23 @@ resolve_image() {
             image_mount=""
             ;;
         *)
-            image_guest=/image/$(basename "$abs")
+            image_guest=${2:-/image}/$(basename "$abs")
             image_mount="-v $abs:$image_guest:$image_mode"
+            ;;
+    esac
+}
+
+# QEMU cannot read a vendor's zip, so the firmware inside it is written out
+# under out/ and booted from there.
+unzip_image() {
+    case $image_host in
+        *.zip|*.ZIP)
+            mkdir -p out/firmware
+            unzipped=out/firmware/$(basename "${image_host%.*}").bin
+            python3 scripts/imgtool.py unzip "$image_host" -o "$unzipped"
+            image_host=$root/$unzipped
+            image_guest=/work/$unzipped
+            image_mount=""
             ;;
     esac
 }
@@ -107,14 +124,17 @@ usage: ./rtl838x.sh <command> [arguments]
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
   test-stock <image>      the same for a vendor image (Zyxel .bix, Teltonika
-                          TSW2xx), which is installed into a scratch flash and
-                          booted from it
+                          TSW2xx, HPE 1920 .bin), booted with a scratch flash
   mkflash <image> <flash> write a 16 MiB flash image with the firmware
-                          installed and a U-Boot environment; extra arguments
-                          go to "imgtool.py mkflash"
-  run-flash <flash> [...] boot what is installed in a flash image, the way the
-                          stock bootloader does; writes go to the file; the
-                          host's network, as with run
+                          installed and a U-Boot environment, or for HPE's
+                          firmware a 32 MiB one with a MAC address; extra
+                          arguments go to "imgtool.py mkflash"
+  run-flash <flash> [image] [...]
+                          boot what is installed in a flash image, the way the
+                          stock bootloader does, or the image given after it
+                          (HPE's, which the machine cannot boot from flash);
+                          writes go to the file; the host's network, as with
+                          run
   shell                   open a shell in the build container
   info [image]            summarise a firmware image
   dts [image]             print the device tree embedded in a firmware image
@@ -123,7 +143,8 @@ usage: ./rtl838x.sh <command> [arguments]
 
 The image defaults to \$IMAGE, currently
   $IMAGE
-Images outside this directory are mounted into the container automatically.
+Images outside this directory are mounted into the container automatically,
+and a vendor's zip can stand in for the firmware file inside it.
 
 Environment: IMAGE, BUILDER, RUNTIME, DOCKER, DEBUG=1 (build QEMU with -O0
 and assertions).
@@ -161,6 +182,7 @@ cmd_runtime_image() {
 }
 
 run_qemu() {
+    unzip_image
     cmd_runtime_image
     with_host_network
     echo "booting $image_host" >&2
@@ -176,17 +198,40 @@ cmd_run() {
 }
 
 # No -kernel: the machine loads the uImage from the flash's first image slot.
+# HPE's Comware is booted by a BootWare this machine does not have, so its
+# firmware comes after the flash and is given to -kernel, the flash being
+# where its configuration goes.
 cmd_run_flash() {
     [ $# -ge 1 ] || die "run-flash needs a flash image"
     image_mode=rw
     resolve_image "$1"
     shift
+    flash_host=$image_host
+    flash_guest=$image_guest
+    flash_mount=$image_mount
+    kernel=""
+    case ${1:--} in
+        -*) ;;
+        *)
+            image_mode=ro
+            resolve_image "$1" /firmware
+            shift
+            unzip_image
+            kernel=$image_guest
+            ;;
+    esac
+    image_mount="$flash_mount ${kernel:+$image_mount}"
     cmd_runtime_image
     with_host_network
-    echo "booting from flash $image_host" >&2
+    if [ -n "$kernel" ]; then
+        echo "booting $image_host with flash $flash_host" >&2
+        set -- -kernel "$kernel" "$@"
+    else
+        echo "booting from flash $flash_host" >&2
+    fi
     in_container "$RUNTIME" "$QEMU" \
         -M rtl838x -m 128 -nographic -no-reboot \
-        -drive "if=mtd,format=raw,file=$image_guest" "$@"
+        -drive "if=mtd,format=raw,file=$flash_guest" "$@"
 }
 
 cmd_mkflash() {

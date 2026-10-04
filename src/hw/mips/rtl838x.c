@@ -19,6 +19,10 @@
  * device tree at all and boots on the same machine.  It wants to be booted
  * from flash, with the chip it knows: see the flash-model property.
  *
+ * HPE's Comware for the 1920 series is booted from the file its BootWare
+ * would load, given to -kernel; that file is what tells the machine it is an
+ * HPE 1920-8G, with that board's flash chip and straps.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -73,6 +77,51 @@
 #define UIMAGE_UNPACK_MAX   (32 * MiB)
 
 /*
+ * HPE's Comware firmware for the 1920 series, the .bin the switch keeps in
+ * its file system as main.bin.  It starts with a table of segments --
+ * BootWare's two halves and the application -- and BootWare boots the last:
+ * a header, then a 7-Zip archive holding one LZMA-compressed file, a raw
+ * image for 0x80100000 that begins with its own entry stub.  The machine
+ * does the same, so the file can be given to -kernel as it is.
+ */
+#define CMW_SEG_COUNT       0x04    /* how many entries the table has */
+#define CMW_SEG_TABLE       0x20
+#define CMW_SEG_ENTRY_SIZE  0x18    /* type, offset, size, then checksums */
+#define CMW_SEG_MAX         8
+#define CMW_SEG_APP         0x04000000
+#define CMW_SEG_HEADER_SIZE 0x154
+
+/*
+ * What an HPE 1920-8G has that the GS1900-8 does not: a 32 MiB flash, which
+ * its straps have addressed with four bytes, and two SFP cages behind the
+ * SerDes, which they set to fibre.
+ */
+#define HPE_INT_MODE_CTRL   0x9
+
+/* Where the stack a bootloader would leave is: this far below the top of RAM. */
+#define RTL838X_BOOT_STACK_GAP  (1 * MiB)
+
+/*
+ * 7-Zip, as far as Comware's archives need it: a 32-byte signature header
+ * pointing at a plain header that describes one packed stream and one LZMA
+ * coder.  Anything else is refused.
+ */
+#define SZ_SIG_HEADER_SIZE  32
+#define SZ_END              0x00
+#define SZ_HEADER           0x01
+#define SZ_MAIN_STREAMS     0x04
+#define SZ_PACK_INFO        0x06
+#define SZ_UNPACK_INFO      0x07
+#define SZ_SIZE             0x09
+#define SZ_CRC              0x0a
+#define SZ_FOLDER           0x0b
+#define SZ_UNPACK_SIZE      0x0c
+#define SZ_LZMA_PROPS_SIZE  5
+
+static const uint8_t sz_signature[6] = { '7', 'z', 0xbc, 0xaf, 0x27, 0x1c };
+static const uint8_t sz_lzma_id[3] = { 0x03, 0x01, 0x01 };
+
+/*
  * Where the stock bootloaders keep their environment: the GS1900's at
  * 0x40000, the TSW2xx's at 0x80000.  64 KiB each, a CRC32 of the rest first.
  */
@@ -91,6 +140,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RTL838xMachineState, RTL838X_MACHINE)
 typedef struct ResetData {
     MIPSCPU *cpu;
     uint64_t vector;
+    uint64_t sp;
     BlockBackend *flash;    /* boot from here, when there is no -kernel */
 } ResetData;
 
@@ -133,6 +183,13 @@ static void main_cpu_reset(void *opaque)
     env->active_tc.gpr[5] = 0;
     env->active_tc.gpr[6] = 0;
     env->active_tc.gpr[7] = 0;
+
+    /*
+     * A stack, as a bootloader leaves one behind.  Linux sets up its own
+     * before it uses one; Comware's entry stub saves a register to it first
+     * thing, and with sp at zero that is an address error.
+     */
+    env->active_tc.gpr[29] = s->sp;
 }
 
 static uint32_t be32_at(const uint8_t *p)
@@ -328,23 +385,188 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 }
 
 /*
- * Accepts, in order of preference: a uImage (either magic), an ELF vmlinux,
- * or a raw kernel binary.  Returns the entry point.
+ * Where the application's archive starts in a Comware .bin, with its length
+ * in *app_len, or NULL if buf is no such file.
  */
-static uint64_t rtl838x_load_kernel(MachineState *machine)
+static const uint8_t *rtl838x_comware_app(const uint8_t *buf, size_t len,
+                                          size_t *app_len)
+{
+    uint32_t count;
+
+    if (len < CMW_SEG_TABLE) {
+        return NULL;
+    }
+    count = be32_at(buf + CMW_SEG_COUNT);
+    if (count > CMW_SEG_MAX ||
+        len < CMW_SEG_TABLE + count * CMW_SEG_ENTRY_SIZE) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *e = buf + CMW_SEG_TABLE + i * CMW_SEG_ENTRY_SIZE;
+        uint64_t off = be32_at(e + 4);
+        uint64_t size = be32_at(e + 8);
+
+        if (be32_at(e) != CMW_SEG_APP || off + size > len ||
+            size < CMW_SEG_HEADER_SIZE + SZ_SIG_HEADER_SIZE ||
+            memcmp(buf + off + CMW_SEG_HEADER_SIZE, sz_signature,
+                   sizeof(sz_signature))) {
+            continue;
+        }
+        *app_len = size - CMW_SEG_HEADER_SIZE;
+        return buf + off + CMW_SEG_HEADER_SIZE;
+    }
+    return NULL;
+}
+
+typedef struct SzReader {
+    const uint8_t *p, *end;
+    bool bad;
+} SzReader;
+
+static uint8_t sz_byte(SzReader *r)
+{
+    if (r->p >= r->end) {
+        r->bad = true;
+        return 0;
+    }
+    return *r->p++;
+}
+
+/*
+ * 7-Zip's numbers: the leading ones of the first byte count the bytes that
+ * follow, least significant first, and what is left of it goes on top.
+ */
+static uint64_t sz_number(SzReader *r)
+{
+    uint8_t first = sz_byte(r);
+    uint64_t value = 0;
+
+    for (unsigned i = 0; i < 8; i++) {
+        uint8_t mask = 0x80 >> i;
+
+        if (!(first & mask)) {
+            return value | ((uint64_t)(first & (mask - 1)) << (8 * i));
+        }
+        value |= (uint64_t)sz_byte(r) << (8 * i);
+    }
+    return value;
+}
+
+/*
+ * The one file in a Comware archive, unpacked; its size goes to *size.  At
+ * most max bytes, or NULL with errp set.
+ */
+static uint8_t *rtl838x_unpack_7z(const uint8_t *buf, size_t len, size_t max,
+                                  size_t *size, const char *what, Error **errp)
+{
+    uint8_t props[SZ_LZMA_PROPS_SIZE], id[sizeof(sz_lzma_id)];
+    uint64_t next_off, next_len, pack_pos, pack_len, unpack_len;
+    g_autofree uint8_t *alone = NULL;
+    g_autofree uint8_t *out = NULL;
+    SzReader r;
+    uint8_t b;
+
+    if (len < SZ_SIG_HEADER_SIZE) {
+        goto bad;
+    }
+    next_off = ldq_le_p(buf + 12);
+    next_len = ldq_le_p(buf + 20);
+    if (next_off > len - SZ_SIG_HEADER_SIZE ||
+        next_len > len - SZ_SIG_HEADER_SIZE - next_off) {
+        goto bad;
+    }
+    r.p = buf + SZ_SIG_HEADER_SIZE + next_off;
+    r.end = r.p + next_len;
+    r.bad = false;
+
+    /* One packed stream, its size, and perhaps its CRC. */
+    if (sz_byte(&r) != SZ_HEADER || sz_byte(&r) != SZ_MAIN_STREAMS ||
+        sz_byte(&r) != SZ_PACK_INFO) {
+        goto bad;
+    }
+    pack_pos = sz_number(&r);
+    if (sz_number(&r) != 1 || sz_byte(&r) != SZ_SIZE) {
+        goto bad;
+    }
+    pack_len = sz_number(&r);
+    b = sz_byte(&r);
+    if (b == SZ_CRC) {
+        if (sz_byte(&r) != 1) {
+            goto bad;
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            sz_byte(&r);
+        }
+        b = sz_byte(&r);
+    }
+    if (b != SZ_END) {
+        goto bad;
+    }
+
+    /* One folder of one coder, LZMA, with its five bytes of properties. */
+    if (sz_byte(&r) != SZ_UNPACK_INFO || sz_byte(&r) != SZ_FOLDER ||
+        sz_number(&r) != 1 || sz_byte(&r) != 0 || sz_number(&r) != 1 ||
+        sz_byte(&r) != (0x20 | sizeof(sz_lzma_id))) {
+        goto bad;
+    }
+    for (unsigned i = 0; i < sizeof(id); i++) {
+        id[i] = sz_byte(&r);
+    }
+    if (memcmp(id, sz_lzma_id, sizeof(id)) ||
+        sz_number(&r) != SZ_LZMA_PROPS_SIZE) {
+        goto bad;
+    }
+    for (unsigned i = 0; i < sizeof(props); i++) {
+        props[i] = sz_byte(&r);
+    }
+    if (sz_byte(&r) != SZ_UNPACK_SIZE) {
+        goto bad;
+    }
+    unpack_len = sz_number(&r);
+    if (r.bad || pack_pos > len - SZ_SIG_HEADER_SIZE ||
+        pack_len > len - SZ_SIG_HEADER_SIZE - pack_pos) {
+        goto bad;
+    }
+    if (unpack_len > max) {
+        error_setg(errp, "the application in %s is %" PRIu64 " bytes, more "
+                   "than fits in RAM", what, unpack_len);
+        return NULL;
+    }
+
+    /* The stream as LZMA's "alone" format has it: properties, size, data. */
+    alone = g_malloc(SZ_LZMA_PROPS_SIZE + 8 + pack_len);
+    memcpy(alone, props, SZ_LZMA_PROPS_SIZE);
+    stq_le_p(alone + SZ_LZMA_PROPS_SIZE, unpack_len);
+    memcpy(alone + SZ_LZMA_PROPS_SIZE + 8,
+           buf + SZ_SIG_HEADER_SIZE + pack_pos, pack_len);
+    out = g_malloc(unpack_len);
+    if (rtl838x_unlzma(out, unpack_len, alone, SZ_LZMA_PROPS_SIZE + 8 +
+                       pack_len) != unpack_len) {
+        error_setg(errp, "could not unpack the application in %s", what);
+        return NULL;
+    }
+    *size = unpack_len;
+    return g_steal_pointer(&out);
+
+bad:
+    error_setg(errp, "the application in %s is not a 7-Zip archive of the "
+               "kind Comware uses", what);
+    return NULL;
+}
+
+/*
+ * Accepts, in order of preference: a uImage (either magic), HPE's Comware
+ * .bin, an ELF vmlinux, or a raw kernel binary.  buf holds the file.
+ * Returns the entry point.
+ */
+static uint64_t rtl838x_load_kernel(MachineState *machine, const char *buf,
+                                    gsize len)
 {
     const char *filename = machine->kernel_filename;
-    g_autofree char *buf = NULL;
-    g_autoptr(GError) gerr = NULL;
-    gsize len = 0;
+    const uint8_t *app;
+    size_t app_len;
     uint64_t entry;
     ssize_t size;
-
-    if (!g_file_get_contents(filename, &buf, &len, &gerr)) {
-        error_report("could not read kernel '%s': %s", filename,
-                     gerr->message);
-        exit(1);
-    }
 
     if (len >= UIMAGE_HEADER_SIZE) {
         const uint8_t *hdr = (const uint8_t *)buf;
@@ -368,6 +590,21 @@ static uint64_t rtl838x_load_kernel(MachineState *machine)
         }
     }
 
+    app = rtl838x_comware_app((const uint8_t *)buf, len, &app_len);
+    if (app) {
+        hwaddr load = cpu_mips_kseg0_to_phys(NULL, RTL838X_KERNEL_LOAD);
+        size_t image_len = 0;
+        g_autofree uint8_t *image =
+            rtl838x_unpack_7z(app, app_len,
+                              machine->ram_size - RTL838X_BOOT_STACK_GAP - load,
+                              &image_len, filename, &error_fatal);
+
+        info_report("loading Comware application (%zu bytes) at 0x%x",
+                    image_len, RTL838X_KERNEL_LOAD);
+        rom_add_blob_fixed("rtl838x.kernel", image, image_len, load);
+        return RTL838X_KERNEL_LOAD;
+    }
+
     size = load_elf(filename, NULL, cpu_mips_kseg0_to_phys, NULL, &entry, NULL,
                     NULL, NULL, ELFDATA2MSB, EM_MIPS, 1, 0);
     if (size >= 0) {
@@ -389,10 +626,33 @@ static void rtl838x_init(MachineState *machine)
     ResetData *reset_info;
     DeviceState *intc, *dev, *flash;
     DriveInfo *flash_dinfo;
+    g_autofree char *kernel = NULL;
+    gsize kernel_len = 0;
+    const char *flash_model;
+    size_t app_len;
+    bool hpe = false;
     MACAddr mac;
     MIPSCPU *cpu;
     CPUMIPSState *env;
     Clock *cpuclk;
+
+    /*
+     * The kernel image first: HPE's Comware is what makes this an HPE
+     * 1920-8G rather than a GS1900-8, and the flash and the switch are
+     * built accordingly.
+     */
+    if (machine->kernel_filename) {
+        g_autoptr(GError) gerr = NULL;
+
+        if (!g_file_get_contents(machine->kernel_filename, &kernel,
+                                 &kernel_len, &gerr)) {
+            error_report("could not read kernel '%s': %s",
+                         machine->kernel_filename, gerr->message);
+            exit(1);
+        }
+        hpe = rtl838x_comware_app((const uint8_t *)kernel, kernel_len,
+                                  &app_len) != NULL;
+    }
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, RTL838X_CPU_HZ);
@@ -403,6 +663,8 @@ static void rtl838x_init(MachineState *machine)
     reset_info = g_new0(ResetData, 1);
     reset_info->cpu = cpu;
     reset_info->vector = env->active_tc.PC;
+    reset_info->sp = cpu_mips_phys_to_kseg0(NULL, machine->ram_size -
+                                            RTL838X_BOOT_STACK_GAP);
     qemu_register_reset(main_cpu_reset, reset_info);
 
     memory_region_add_subregion(sysmem, RTL838X_RAM_BASE, machine->ram);
@@ -438,18 +700,21 @@ static void rtl838x_init(MachineState *machine)
     dev = qdev_new(TYPE_RTL838X_SOCMISC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_MC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, RTL838X_FLASH_WINDOW);
 
     /*
      * The SPI-NOR flash on chip select 0 of the controller in that window,
      * backed by "-drive if=mtd" when there is one.
      */
     flash_dinfo = drive_get(IF_MTD, 0, 0);
-    if (!object_class_by_name(rms->flash_model)) {
+    flash_model = rms->flash_model ? rms->flash_model
+                : hpe ? RTL838X_FLASH_TYPE_HPE : RTL838X_FLASH_TYPE;
+    if (!object_class_by_name(flash_model)) {
         error_report("flash-model '%s' is not a flash chip QEMU models",
-                     rms->flash_model);
+                     flash_model);
         exit(1);
     }
-    flash = qdev_new(rms->flash_model);
+    flash = qdev_new(flash_model);
     if (flash_dinfo) {
         qdev_prop_set_drive_err(flash, "drive",
                                 blk_by_legacy_dinfo(flash_dinfo), &error_fatal);
@@ -519,6 +784,10 @@ static void rtl838x_init(MachineState *machine)
         mac.a[0] = (mac.a[0] & 0xfc) | 0x02;
     }
     qdev_prop_set_macaddr(dev, "macaddr", mac.a);
+    if (hpe) {
+        qdev_prop_set_uint32(dev, "int-mode-ctrl", HPE_INT_MODE_CTRL);
+        qdev_prop_set_bit(dev, "flash-4byte", true);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_SW_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -564,7 +833,7 @@ static void rtl838x_init(MachineState *machine)
     }
 
     if (machine->kernel_filename) {
-        reset_info->vector = rtl838x_load_kernel(machine);
+        reset_info->vector = rtl838x_load_kernel(machine, kernel, kernel_len);
     } else if (flash_dinfo) {
         reset_info->flash = blk_by_legacy_dinfo(flash_dinfo);
         /* Fail now rather than at the first reset, with no output. */
@@ -578,7 +847,9 @@ static void rtl838x_init(MachineState *machine)
 
 static char *rtl838x_get_flash_model(Object *obj, Error **errp)
 {
-    return g_strdup(RTL838X_MACHINE(obj)->flash_model);
+    const char *model = RTL838X_MACHINE(obj)->flash_model;
+
+    return g_strdup(model ? model : RTL838X_FLASH_TYPE);
 }
 
 static void rtl838x_set_flash_model(Object *obj, const char *value,
@@ -590,11 +861,6 @@ static void rtl838x_set_flash_model(Object *obj, const char *value,
     rms->flash_model = g_strdup(value);
 }
 
-static void rtl838x_machine_instance_init(Object *obj)
-{
-    RTL838X_MACHINE(obj)->flash_model = g_strdup(RTL838X_FLASH_TYPE);
-}
-
 static void rtl838x_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -604,11 +870,14 @@ static void rtl838x_machine_class_init(ObjectClass *oc, const void *data)
      * a current kernel needs SFDP tables from a chip with the real one's
      * JEDEC ID, which QEMU's model of it lacks, hence the default; the vendor
      * kernel knows nothing but the real ID, c2 20 18, "mx25l12805d" here.
+     * An HPE 1920 has a 32 MiB chip instead, the default when -kernel is its
+     * firmware.
      */
     object_class_property_add_str(oc, "flash-model", rtl838x_get_flash_model,
                                   rtl838x_set_flash_model);
     object_class_property_set_description(oc, "flash-model",
-        "m25p80 model of the SPI-NOR flash (default " RTL838X_FLASH_TYPE ")");
+        "m25p80 model of the SPI-NOR flash (default " RTL838X_FLASH_TYPE
+        ", " RTL838X_FLASH_TYPE_HPE " for HPE's Comware)");
 
     mc->desc = "Realtek RTL8380M switch SoC";
     mc->init = rtl838x_init;
@@ -632,7 +901,6 @@ static const TypeInfo rtl838x_machine_types[] = {
         .name          = TYPE_RTL838X_MACHINE,
         .parent        = TYPE_MACHINE,
         .instance_size = sizeof(RTL838xMachineState),
-        .instance_init = rtl838x_machine_instance_init,
         .class_init    = rtl838x_machine_class_init,
     },
 };
