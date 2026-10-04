@@ -167,6 +167,16 @@
 #define SW_ALL_PORTS            0x1fffffff
 #define SW_MC_PMSK_LAST_ROW     511
 
+/*
+ * The engine that reaches an RTL8231 GPIO expander on the GPIO lines, as
+ * the GS108Tv3 has: bit 0 runs, bit 1 writes, the register in [11:7], the
+ * data in [31:16].  The PHY address in [6:2] does not matter, the expander
+ * is the only thing on that bus.
+ */
+#define SW_EXT_GPIO_INDRT_ACCESS 0xa09c
+#define SW_EXT_GPIO_RUN         (1u << 0)
+#define SW_EXT_GPIO_WRITE       (1u << 1)
+
 #define SW_SMI_RUN              (1u << 0)
 #define SW_SMI_CMD_MASK         (3u << 1)
 #define SW_SMI_CMD_READ_C22     (0u << 1)
@@ -644,6 +654,22 @@ static void rtl838x_switch_write(void *opaque, hwaddr addr, uint64_t val,
     case SW_THERMAL_RESULT:
         return;     /* sensor output */
 
+    case SW_EXT_GPIO_INDRT_ACCESS:
+        if ((val & SW_EXT_GPIO_RUN) && s->gpio &&
+            rtl838x_gpio_has_rtl8231(s->gpio)) {
+            unsigned reg = extract32(val, 7, 5);
+
+            if (val & SW_EXT_GPIO_WRITE) {
+                rtl838x_gpio_rtl8231_write(s->gpio, reg, val >> 16);
+            } else {
+                val = deposit32(val, 16, 16,
+                                rtl838x_gpio_rtl8231_read(s->gpio, reg));
+            }
+            val &= ~SW_EXT_GPIO_RUN;
+        }
+        s->regs[addr / 4] = val;
+        return;
+
     default:
         break;
     }
@@ -844,6 +870,8 @@ static const Property rtl838x_switch_properties[] = {
     DEFINE_PROP_MACADDR("macaddr", RTL838xSwitchState, macaddr),
     DEFINE_PROP_UINT32("int-mode-ctrl", RTL838xSwitchState, int_mode_ctrl, 0),
     DEFINE_PROP_BOOL("flash-4byte", RTL838xSwitchState, flash_4byte, false),
+    DEFINE_PROP_LINK("gpio", RTL838xSwitchState, gpio, TYPE_RTL838X_GPIO,
+                     RTL838xGpioState *),
 };
 
 static void rtl838x_switch_class_init(ObjectClass *oc, const void *data)

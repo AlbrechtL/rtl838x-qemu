@@ -65,10 +65,12 @@
  * unmodified.  The vendor's images use the same magic around a gzip'ed
  * kernel, which the bootloader, and so this machine, inflates.  Teltonika's
  * RutOS images are a plain uImage around an LZMA kernel, with no rt-loader,
- * and get the same treatment.
+ * and get the same treatment.  Netgear's smart switches have a magic of
+ * their own, "NGE " for the GS108Tv3 family, around an LZMA kernel.
  */
 #define UIMAGE_MAGIC        0x27051956
 #define UIMAGE_MAGIC_RTL    0x83800000
+#define UIMAGE_MAGIC_NGE    0x4e474520
 #define UIMAGE_HEADER_SIZE  64
 #define UIMAGE_COMP_NONE    0
 #define UIMAGE_COMP_GZIP    1
@@ -123,10 +125,11 @@ static const uint8_t sz_lzma_id[3] = { 0x03, 0x01, 0x01 };
 
 /*
  * Where the stock bootloaders keep their environment: the GS1900's at
- * 0x40000, the TSW2xx's at 0x80000.  64 KiB each, a CRC32 of the rest first.
+ * 0x40000, the TSW2xx's at 0x80000, the GS108Tv3's at 0xe0000.  64 KiB
+ * each, a CRC32 of the rest first.
  */
 #define UBOOT_ENV_SIZE      0x10000
-static const uint32_t uboot_env_offsets[] = { 0x40000, 0x80000 };
+static const uint32_t uboot_env_offsets[] = { 0x40000, 0x80000, 0xe0000 };
 
 struct RTL838xMachineState {
     MachineState parent_obj;
@@ -196,6 +199,14 @@ static uint32_t be32_at(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
+}
+
+static bool rtl838x_is_uimage(const uint8_t *hdr)
+{
+    uint32_t magic = be32_at(hdr);
+
+    return magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL ||
+           magic == UIMAGE_MAGIC_NGE;
 }
 
 /*
@@ -312,37 +323,35 @@ static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload
 }
 
 /*
- * The stock bootloader's part: the uImage at the start of the flash's first
- * image slot, copied to its load address.  The GS1900's slot is tried
- * first, then the TSW2xx's.  Reads the flash through the block layer, so a
- * firmware update the guest wrote is what the next reset boots.  Returns
- * the entry point.
- */
-/*
  * Where in the flash the firmware is: the GS1900's first image slot, else
- * the TSW2xx's, with its uImage header in hdr.  0 if neither holds one.
+ * the TSW2xx's, else the GS108Tv3's, with its uImage header in hdr.  0 if
+ * none holds one.
  */
 static uint32_t rtl838x_flash_slot(BlockBackend *blk,
                                    uint8_t hdr[UIMAGE_HEADER_SIZE])
 {
     static const uint32_t slots[] = {
         RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
+        RTL838X_FLASH_FIRMWARE_NETGEAR,
     };
 
     for (unsigned i = 0; i < ARRAY_SIZE(slots); i++) {
-        uint32_t magic;
-
         if (blk_pread(blk, slots[i], UIMAGE_HEADER_SIZE, hdr, 0) < 0) {
             continue;
         }
-        magic = be32_at(hdr);
-        if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL) {
+        if (rtl838x_is_uimage(hdr)) {
             return slots[i];
         }
     }
     return 0;
 }
 
+/*
+ * The stock bootloader's part: the uImage at the start of the flash's first
+ * image slot, copied to its load address.  Reads the flash through the
+ * block layer, so a firmware update the guest wrote is what the next reset
+ * boots.  Returns the entry point.
+ */
 static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 {
     uint8_t hdr[UIMAGE_HEADER_SIZE];
@@ -356,12 +365,13 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 
     slot = rtl838x_flash_slot(blk, hdr);
     if (!slot) {
-        error_setg(errp, "no uImage in flash at 0x%x or 0x%x: nothing to "
-                   "boot; install a firmware first, or boot one with -kernel",
-                   RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW);
+        error_setg(errp, "no uImage in flash at 0x%x, 0x%x or 0x%x: nothing "
+                   "to boot; install a firmware first, or boot one with "
+                   "-kernel", RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
+                   RTL838X_FLASH_FIRMWARE_NETGEAR);
         return 0;
     }
-    size = rtl838x_check_uimage(hdr, RTL838X_FLASH_SIZE - slot, "flash",
+    size = rtl838x_check_uimage(hdr, blk_getlength(blk) - slot, "flash",
                                 errp);
     if (!size) {
         return 0;
@@ -555,7 +565,7 @@ bad:
 }
 
 /*
- * Accepts, in order of preference: a uImage (either magic), HPE's Comware
+ * Accepts, in order of preference: a uImage (any of the magics), HPE's Comware
  * .bin, an ELF vmlinux, or a raw kernel binary.  buf holds the file.
  * Returns the entry point.
  */
@@ -570,9 +580,8 @@ static uint64_t rtl838x_load_kernel(MachineState *machine, const char *buf,
 
     if (len >= UIMAGE_HEADER_SIZE) {
         const uint8_t *hdr = (const uint8_t *)buf;
-        uint32_t magic = be32_at(hdr);
 
-        if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL) {
+        if (rtl838x_is_uimage(hdr)) {
             uint64_t load = be32_at(hdr + 16);
             uint64_t ep = be32_at(hdr + 20);
             g_autofree char *name = g_strndup(buf + 32, 32);
@@ -624,13 +633,15 @@ static void rtl838x_init(MachineState *machine)
     MemoryRegion *sram = g_new(MemoryRegion, 1);
     MemoryRegion *sram_alias = g_new(MemoryRegion, 1);
     ResetData *reset_info;
-    DeviceState *intc, *dev, *flash;
+    DeviceState *intc, *dev, *flash, *gpio;
     DriveInfo *flash_dinfo;
     g_autofree char *kernel = NULL;
     gsize kernel_len = 0;
     const char *flash_model;
     size_t app_len;
     bool hpe = false;
+    bool netgear = false;
+    uint32_t flash_slot = 0;
     MACAddr mac;
     MIPSCPU *cpu;
     CPUMIPSState *env;
@@ -652,6 +663,23 @@ static void rtl838x_init(MachineState *machine)
         }
         hpe = rtl838x_comware_app((const uint8_t *)kernel, kernel_len,
                                   &app_len) != NULL;
+        netgear = kernel_len >= UIMAGE_HEADER_SIZE &&
+                  be32_at((const uint8_t *)kernel) == UIMAGE_MAGIC_NGE;
+    }
+
+    /*
+     * Then the flash: which slot holds a firmware says which board this is
+     * when there is no kernel.  The firmware where the TSW2xx keeps it makes
+     * a TSW2xx; Netgear's makes a GS108Tv3.
+     */
+    flash_dinfo = drive_get(IF_MTD, 0, 0);
+    if (flash_dinfo) {
+        uint8_t hdr[UIMAGE_HEADER_SIZE];
+
+        flash_slot = rtl838x_flash_slot(blk_by_legacy_dinfo(flash_dinfo), hdr);
+        if (!machine->kernel_filename && flash_slot) {
+            netgear = be32_at(hdr) == UIMAGE_MAGIC_NGE;
+        }
     }
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
@@ -706,9 +734,8 @@ static void rtl838x_init(MachineState *machine)
      * The SPI-NOR flash on chip select 0 of the controller in that window,
      * backed by "-drive if=mtd" when there is one.
      */
-    flash_dinfo = drive_get(IF_MTD, 0, 0);
     flash_model = rms->flash_model ? rms->flash_model
-                : hpe ? RTL838X_FLASH_TYPE_HPE : RTL838X_FLASH_TYPE;
+                : hpe || netgear ? RTL838X_FLASH_TYPE_32M : RTL838X_FLASH_TYPE;
     if (!object_class_by_name(flash_model)) {
         error_report("flash-model '%s' is not a flash chip QEMU models",
                      flash_model);
@@ -745,22 +772,24 @@ static void rtl838x_init(MachineState *machine)
 
     dev = qdev_new(TYPE_RTL838X_GPIO);
     /*
-     * The board's pull-ups.  A flash with the firmware where the TSW2xx
-     * keeps it is taken for one, and that board pulls its GPIO lines up; see
-     * rtl838x_gpio.c.  The GS1900 is left as it was.
+     * What hangs off the GPIO lines.  The TSW2xx pulls its lines up; the
+     * GS108Tv3 its reset button, and it has the RTL8231 Netgear's firmware
+     * reads its model from.  See rtl838x_gpio.c.  The GS1900 is left as it
+     * was.
      */
-    if (flash_dinfo) {
-        uint8_t hdr[UIMAGE_HEADER_SIZE];
-
-        if (rtl838x_flash_slot(blk_by_legacy_dinfo(flash_dinfo), hdr) ==
-            RTL838X_FLASH_FIRMWARE_TSW) {
-            qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_TSW_PULLUPS);
-        }
+    if (flash_slot == RTL838X_FLASH_FIRMWARE_TSW) {
+        qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_TSW_PULLUPS);
+    }
+    if (netgear) {
+        qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_GS108TV3_PULLUPS);
+        qdev_prop_set_bit(dev, "rtl8231", true);
+        qdev_prop_set_uint64(dev, "rtl8231-straps", RTL838X_RTL8231_GS108TV3);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_GPIO_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(intc, RTL838X_IRQ_GPIO));
+    gpio = dev;
 
     /*
      * The switch core, and with it the CPU-port DMA engine: the device tree
@@ -784,8 +813,11 @@ static void rtl838x_init(MachineState *machine)
         mac.a[0] = (mac.a[0] & 0xfc) | 0x02;
     }
     qdev_prop_set_macaddr(dev, "macaddr", mac.a);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio), &error_abort);
     if (hpe) {
         qdev_prop_set_uint32(dev, "int-mode-ctrl", HPE_INT_MODE_CTRL);
+    }
+    if (hpe || netgear) {
         qdev_prop_set_bit(dev, "flash-4byte", true);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -870,14 +902,14 @@ static void rtl838x_machine_class_init(ObjectClass *oc, const void *data)
      * a current kernel needs SFDP tables from a chip with the real one's
      * JEDEC ID, which QEMU's model of it lacks, hence the default; the vendor
      * kernel knows nothing but the real ID, c2 20 18, "mx25l12805d" here.
-     * An HPE 1920 has a 32 MiB chip instead, the default when -kernel is its
-     * firmware.
+     * An HPE 1920 and a Netgear GS108Tv3 have a 32 MiB chip instead, the
+     * default when the firmware is theirs.
      */
     object_class_property_add_str(oc, "flash-model", rtl838x_get_flash_model,
                                   rtl838x_set_flash_model);
     object_class_property_set_description(oc, "flash-model",
         "m25p80 model of the SPI-NOR flash (default " RTL838X_FLASH_TYPE
-        ", " RTL838X_FLASH_TYPE_HPE " for HPE's Comware)");
+        ", " RTL838X_FLASH_TYPE_32M " for HPE's and Netgear's firmware)");
 
     mc->desc = "Realtek RTL8380M switch SoC";
     mc->init = rtl838x_init;

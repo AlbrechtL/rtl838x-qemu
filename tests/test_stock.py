@@ -7,7 +7,8 @@ scratch flash first, the way "./rtl838x.sh mkflash" does it, and the machine
 is started without -kernel.  Everything after that goes through the vendor
 CLI on the serial console and through the front-panel ports.  Run it through
 "./rtl838x.sh test-stock <image.bix>", which supplies the container.
-Teltonika's firmware is handed on to test_tsw.py, HPE's to test_hpe.py.
+Teltonika's firmware is handed on to test_tsw.py, HPE's to test_hpe.py,
+Netgear's to test_netgear.py.
 """
 
 import argparse
@@ -90,6 +91,9 @@ def main():
     if isinstance(image, imgtool.Comware):
         import test_hpe
         return test_hpe.run(args)
+    if image.is_netgear():
+        import test_netgear
+        return test_netgear.run(args)
 
     flash = tempfile.NamedTemporaryFile(prefix="rtl838x-flash-", suffix=".bin")
     flash.write(imgtool.mkflash(image.data, imgtool.DEFAULT_BDINFO,

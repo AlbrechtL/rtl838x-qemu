@@ -17,6 +17,10 @@ Teltonika's RutOS for the TSW2xx is an OpenWrt sysupgrade image: a uImage
 with the standard magic around an LZMA kernel (device tree appended, no
 rt-loader), then the squashfs root filesystem, then a signature trailer.
 
+Netgear's firmware for the GS108Tv3, GS110TPv3 and GS110TPP is a uImage with
+its own magic, "NGE ", around an LZMA kernel with its root file system
+inside; Realtek's SDK again, on Linux 3.18.
+
 HPE's Comware for the 1920 series is no uImage at all: a table of segments,
 BootWare's two halves and the application, each behind a 0x154-byte header,
 the application a 7-Zip archive around one LZMA-compressed raw image for
@@ -29,7 +33,8 @@ the application a 7-Zip archive around one LZMA-compressed raw image for
     unzip          write out the firmware file inside a vendor's zip
     mkflash        build a 16 MiB flash image with the firmware installed and
                    the two U-Boot environments the vendor firmware reads; for
-                   HPE's firmware, a 32 MiB flash with a MAC address in it
+                   Netgear's, the same in its 32 MiB layout; for HPE's
+                   firmware, a 32 MiB flash with a MAC address in it
 """
 
 import argparse
@@ -44,6 +49,7 @@ import zlib
 
 UIMAGE_MAGIC = 0x27051956
 RTL_MAGIC = 0x83800000
+NETGEAR_MAGIC = 0x4e474520     # "NGE "
 HDR_LEN = 64
 
 COMP_GZIP = 1
@@ -63,6 +69,15 @@ TSW_CONFIG = 0x90000        # "config", the manufacturing data
 TSW_FIRMWARE = 0xa0000      # "firmware"
 TSW_FIRMWARE_END = 0xf70000  # "event-log" follows
 
+# The Netgear GS108Tv3's flash: 32 MiB, the environments further up, and two
+# image slots of 0xe80000 from 0x300000.  The partitions between are JFFS2,
+# which the firmware formats on first boot.
+NETGEAR_FLASH_SIZE = 32 * 1024 * 1024
+NETGEAR_BDINFO = 0xe0000
+NETGEAR_SYSINFO = 0xf0000
+NETGEAR_FIRMWARE = 0x300000
+NETGEAR_FIRMWARE_SIZE = 0xe80000
+
 # Enough of an environment for the vendor firmware to come up: it reads both
 # and dereferences what it did not find.  The values are this project's, not
 # a dump of a real switch.
@@ -79,6 +94,10 @@ DEFAULT_SYSINFO = {
     "bootmsg": "1",
     "resetdefault": "0",
 }
+# Netgear's firmware reads the same, and its serial number from "SN": "show
+# version" and the configuration report it, and the Insight agent sends it.
+# The value is this project's.
+DEFAULT_NETGEAR_BDINFO = dict(DEFAULT_BDINFO, SN="QEMU000000001")
 
 # Realtek's SDK, which RutOS loads as a module, will not start without a
 # hardware profile, and takes its name from the U-Boot environment.  This is
@@ -143,7 +162,7 @@ class Image:
          self.dcrc) = struct.unpack(">7I", data[:28])
         self.os, self.arch, self.type, self.comp = data[28:32]
         self.name = data[32:64].rstrip(b"\0").decode("ascii", "replace")
-        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC):
+        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, NETGEAR_MAGIC):
             raise ValueError(f"not a uImage: magic 0x{self.magic:08x}")
 
     @property
@@ -198,6 +217,10 @@ class Image:
             raise ValueError("no appended DTB found")
         off, totalsize = best
         return k[off:off + totalsize]
+
+    def is_netgear(self):
+        """Whether this is Netgear's firmware, by its magic."""
+        return self.magic == NETGEAR_MAGIC
 
     def is_tsw(self):
         """Whether this is Teltonika's firmware for the TSW2xx."""
@@ -293,6 +316,9 @@ class Comware:
         return unpack_7z(self.archive())
 
     def is_tsw(self):
+        return False
+
+    def is_netgear(self):
         return False
 
 
@@ -400,6 +426,17 @@ def mkflash_tsw(data, env, mnfinfo):
     return bytes(flash)
 
 
+def mkflash_netgear(data, bdinfo, sysinfo):
+    """The GS108Tv3's layout: two environments, the firmware in slot one."""
+    if len(data) > NETGEAR_FIRMWARE_SIZE:
+        raise ValueError("image does not fit the flash")
+    flash = bytearray(b"\xff" * NETGEAR_FLASH_SIZE)
+    flash[NETGEAR_BDINFO:NETGEAR_BDINFO + FLASH_ENV_SIZE] = uboot_env(bdinfo)
+    flash[NETGEAR_SYSINFO:NETGEAR_SYSINFO + FLASH_ENV_SIZE] = uboot_env(sysinfo)
+    flash[NETGEAR_FIRMWARE:NETGEAR_FIRMWARE + len(data)] = data
+    return bytes(flash)
+
+
 def mkflash(data, bdinfo, sysinfo):
     if len(data) > FLASH_SIZE - FLASH_FIRMWARE:
         raise ValueError("image does not fit the flash")
@@ -451,10 +488,13 @@ def main():
             env.setdefault("ethaddr", mnfinfo["mac"])
             flash = mkflash_tsw(img.data, env, mnfinfo)
         else:
-            bdinfo, sysinfo = dict(DEFAULT_BDINFO), dict(DEFAULT_SYSINFO)
+            bdinfo = dict(DEFAULT_NETGEAR_BDINFO if img.is_netgear()
+                          else DEFAULT_BDINFO)
+            sysinfo = dict(DEFAULT_SYSINFO)
             for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
                 env.update(v.split("=", 1) for v in given)
-            flash = mkflash(img.data, bdinfo, sysinfo)
+            flash = (mkflash_netgear if img.is_netgear() else mkflash)(
+                img.data, bdinfo, sysinfo)
         open(args.output, "wb").write(flash)
         print(f"wrote {len(flash)} bytes to {args.output}", file=sys.stderr)
         return
@@ -478,7 +518,8 @@ def main():
             ap.error(f"{args.command}: a Comware image has no device tree")
 
     if args.command == "info":
-        vendor = " (vendor magic)" if img.magic == RTL_MAGIC else ""
+        vendor = {RTL_MAGIC: " (vendor magic)",
+                  NETGEAR_MAGIC: " (Netgear)"}.get(img.magic, "")
         print(f"magic       0x{img.magic:08x}{vendor}")
         print(f"name        {img.name}")
         print(f"size        {img.size} bytes")

@@ -107,6 +107,12 @@
  * throws away.
  */
 #define TAG_RX_PROTO            (4u << 8)   /* in word 1 */
+/*
+ * Word 3 on receive: the VLAN the switch classified the frame into.  Linux
+ * does not look; Netgear's SDK hands a frame to the network stack only on
+ * the VLAN interface this names, and drops one from VLAN 0.
+ */
+#define TAG_RX_VID_MASK         0xfff       /* in word 3 */
 #define TAG_TX_AS_DPM           (1u << 9)   /* in word 2 */
 
 /*
@@ -306,7 +312,8 @@ static void rtl838x_eth_tx(RTL838xSwitchState *s)
  * anything is written.
  */
 void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
-                        unsigned reason, const uint8_t *buf, size_t len)
+                        unsigned reason, uint16_t vid, const uint8_t *buf,
+                        size_t len)
 {
     const unsigned ring = 0;
     size_t total = len + ETH_FCS_LEN;
@@ -376,8 +383,8 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
         /*
          * The tag goes on every fragment; the driver only reads the first
          * one's, but leaving stale values behind in the others is asking for
-         * confusion later.  Word 1 carries the source port and queue, word 4
-         * the reason.
+         * confusion later.  Word 1 carries the source port and queue, word 3
+         * the VLAN, word 4 the reason.
          *
          * The tag is six words.  Linux declares ten, which takes the
          * descriptor to a round 32 bytes, but the last eight bytes are the
@@ -388,6 +395,7 @@ void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
             eth_stw(frag + FRAG_CPU_TAG + w * 2, 0);
         }
         eth_stw(frag + FRAG_CPU_TAG + 1 * 2, TAG_RX_PROTO | (src_port & 0x1f));
+        eth_stw(frag + FRAG_CPU_TAG + 3 * 2, vid & TAG_RX_VID_MASK);
         eth_stw(frag + FRAG_CPU_TAG + 4 * 2, reason & 0xf);
 
         /* Ownership last: everything above must be visible before the CPU

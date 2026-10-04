@@ -8,9 +8,9 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
-Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx and
-HPE's Comware for the 1920-8G all run; see [Tested firmware](#tested-firmware)
-for exactly which.
+Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx,
+HPE's Comware for the 1920-8G and Netgear's firmware for the GS108Tv3 all run;
+see [Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
 comes up, and the switch switches. Each of the eight front-panel ports is its
@@ -54,6 +54,9 @@ no kernel oops or unhandled faults       PASS
 * [HPE firmware](#hpe-firmware)
   * [What Comware needed](#what-comware-needed)
   * [What Comware lacks](#what-comware-lacks)
+* [Netgear firmware](#netgear-firmware)
+  * [What Netgear's firmware needed](#what-netgears-firmware-needed)
+  * [What Netgear's firmware lacks](#what-netgears-firmware-lacks)
 * [How the image boots](#how-the-image-boots)
 * [What is modelled](#what-is-modelled)
 * [How the data path works](#how-the-data-path-works)
@@ -72,10 +75,12 @@ no kernel oops or unhandled faults       PASS
 | Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Zyxel firmware](#zyxel-firmware) |
 | Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
 | HPE Comware 5.20.99 Release 1121 ([download](https://h30326.www3.hpe.com/hpn/1920-8G-JG920A_5.20.R1121.zip?merchantId=ASP_DROPBOX)) | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
+| Netgear 7.1.1.12 ([download](https://www.downloads.netgear.com/files/GDC/GS108Tv3/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip)) | Netgear GS108Tv3, GS110TPv3, GS110TPP v1; run as a GS108Tv3 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Netgear firmware](#netgear-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
-firmware, which makes it a 1920-8G with a 32 MiB flash. Images for other RTL838x
+firmware, which makes it a 1920-8G with a 32 MiB flash, and Netgear's, which
+makes it a GS108Tv3, with a 32 MiB flash too. Images for other RTL838x
 boards may work as well, as long as their device tree asks for nothing more;
 the TSW2xx's two SFP cages are there only as far as its device tree says so,
 and are empty.
@@ -95,7 +100,8 @@ git submodule update --init      # QEMU, pinned at v11.1.1
 Other commands: `run-log` (adds `-d unimp,guest_errors` into `out/qemu.log`),
 `shell` (a shell in the build container), `info` and `dts` (inspect the
 firmware image), `mkflash`, `run-flash` and `test-stock` (for the
-[Zyxel](#zyxel-firmware) and [Teltonika](#teltonika-firmware) firmware),
+[Zyxel](#zyxel-firmware), [Teltonika](#teltonika-firmware),
+[HPE](#hpe-firmware) and [Netgear](#netgear-firmware) firmware),
 `clean`, `distclean`, `help`.
 
 `run`, `run-log`, `test`, `info` and `dts` take the image as their first
@@ -174,7 +180,8 @@ tr '\000' '\377' < /dev/zero | head -c 16M > flash.bin
 With a flash and no `-kernel`, the machine does what the stock bootloader does
 with `bootpartition=0`: it loads the uImage at `0x260000`, the start of the
 first image slot, and starts it -- or, with nothing there, the one at
-`0xa0000`, where the TSW2xx keeps its firmware. It does so on every reset, so
+`0xa0000`, where the TSW2xx keeps its firmware, or the one at `0x300000`,
+where the GS108Tv3 does. It does so on every reset, so
 after an upgrade the reboot starts the new firmware. With `-kernel`, the
 kernel is booted instead, on every reset too, and the flash is just there to
 be installed to -- the way a TFTP-booted initramfs installs a firmware on the
@@ -191,7 +198,8 @@ qemu-system-mips -M rtl838x -m 128 -nographic \
 The bootloader also programs the switch's MAC address registers with
 `ethaddr` from its environment, and the firmware takes its address from there.
 The machine does the same when the flash holds an environment with one, at
-`0x40000` as on the GS1900 or `0x80000` as on the TSW2xx; otherwise the address
+`0x40000` as on the GS1900, `0x80000` as on the TSW2xx or `0xe0000` as on the
+GS108Tv3; otherwise the address
 is a random one, fixed for the life of the QEMU process.
 
 `-drive if=mtd,...,snapshot=on` keeps every write in a temporary file instead,
@@ -654,6 +662,130 @@ OpenWrt, the Zyxel and the Teltonika firmware pass their tests as before.
   PoE models, SSH, SNMP, anything past the web interface's login page, and
   every 1920 model but the 1920-8G.
 
+## Netgear firmware
+
+Netgear's GS108Tv3 is an RTL8380M with eight copper ports, a 32 MiB flash
+and an RTL8231 GPIO expander. Its firmware, shared with the GS110TPv3 and
+the GS110TPP v1, is Realtek's reference firmware for managed switches,
+as Zyxel's is -- the same CLI, the SDK as kernel modules -- but on Linux 3.18,
+with the root file system an initramfs inside the kernel.
+
+The firmware is not in this repository. Tested is 7.1.1.12,
+`GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip`, from
+<https://www.downloads.netgear.com/files/GDC/GS108Tv3/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip>;
+the zip can be used as it is, the tools take the `.bix` out of it.
+
+```sh
+./rtl838x.sh mkflash images/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip netgear.bin
+./rtl838x.sh run-flash netgear.bin \
+    -nic user,net=192.168.0.0/24,host=192.168.0.2,dhcpstart=192.168.0.239,hostfwd=tcp::8080-192.168.0.239:80
+```
+
+The machine finds the image at `0x300000`, takes the `NGE ` magic for
+Netgear's, and builds itself as a GS108Tv3: the 32 MiB flash, the RTL8231,
+the board's reset button. `mkflash` writes the flash in that board's layout:
+
+| Offset | Partition | Content |
+|---|---|---|
+| `0x0000000` | `LOADER` | Erased: there is no bootloader to install, and `show version` reports an empty loader version. |
+| `0x00e0000` | `BDINFO` | A U-Boot environment, the GS1900's plus `SN`, the serial number, which the firmware reports and the Insight agent sends: `QEMU000000001` unless changed. `ethaddr`, `02:E0:4C:83:80:01` unless changed, is the switch's MAC address. `--bdinfo name=value` adds to it. |
+| `0x00f0000` | `SYSINFO` | The second environment, as on the GS1900. `--sysinfo name=value` adds to it. |
+| `0x0100000` | `JFFS2 CFG`, `JFFS2 LOG` | Erased. The firmware formats them on first boot. |
+| `0x0300000` | `RUNTIME` | The `.bix`, byte for byte. |
+| `0x1180000` | `RUNTIME2` | Erased. |
+
+The kernel runs with `quiet`, so the console stays dark until the firmware
+asks for a key, about a minute and a half in:
+
+```
+Press any key to continue
+Username: admin
+Password: ********
+Please change your password from the default settings. ...
+Enter new password  :*********
+Confirm new password:*********
+GS108Tv3# show version
+Loader Version   :
+Loader Date      :
+Firmware Version : 7.1.1.12 (7.1.1.12)
+Firmware Date    : Aug 08 2025 - 00:18:32
+
+MAC Address      : 02:E0:4C:83:80:01
+SN               : QEMU000000001
+```
+
+The account is `admin` / `password`, and the first login has to change the
+password. The firmware asks for an address over DHCP and falls back to
+192.168.0.239; the user network above leases it that very address, so the web
+interface is on <http://localhost:8080>.
+
+```
+$ ./rtl838x.sh test-stock images/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip
+reaches the vendor CLI                   PASS
+logs in, changing the factory password   PASS
+show version names the firmware          PASS
+MAC and serial come from the flash       PASS
+the three cabled ports are up            PASS
+the uncabled ports are down              PASS
+gets a lease from the host on port 3     PASS
+the switch answers an arp for its address PASS
+the switch answers a ping on port 1      PASS
+port 1 to port 2 is switched in hardware PASS
+a frame is not reflected to its source   PASS
+the web interface answers                PASS
+the new password survives a power cycle  PASS
+no SDK failures or kernel oops           PASS
+```
+
+### What Netgear's firmware needed
+
+* **Its magic.** The `.bix` is a uImage with `NGE ` for its magic, around an
+  LZMA kernel for `0x80000000`; the machine takes it for one.
+* **Vectored interrupts.** The kernel installs its interrupt handlers with
+  `set_vi_handler()`, which is a `BUG()` on a CPU without `Config3.VInt`, so
+  it stopped before the console was up. The `rtl8380` CPU model has it now;
+  the real chip must, for the firmware to run on it.
+* **The 32 MiB flash, addressed with four bytes.** The kernel lays out the
+  partitions from the chip's size, and the second image slot needs the upper
+  16 MiB. Without the four-byte strap (bit 29 of `0x100c`, as on the HPE)
+  the JFFS2 partitions read back the start of the flash and the first boot
+  wrote over the image.
+* **The RTL8231, and the board ID on it.** The SDK reads the model from four
+  pins of an RTL8231 at MDIO address 31, through the switch's
+  `EXT_GPIO_INDRT_ACCESS` engine at `0xa09c`, after setting the expander up
+  by bit-banging MDIO on GPIO lines A2 and A3. Pins 1, 0, 2 and 3 are the
+  ID's bits 0 to 3: 1 is the GS108Tv3, 3 the GS110TPv3, 15 the GS110TPP. With
+  no profile for what it read, `rtcore.ko` refused to load, and nothing of
+  the switch came up. The machine has the expander on both paths, its
+  inputs high but for the ID.
+* **The reset button is released.** It is GPIO line A0, active low; read as
+  0, the firmware took it for held and restored its factory defaults and
+  rebooted on every boot. The board pulls it up.
+* **The receive tag names the VLAN.** Word 3 of the receive CPU tag carries
+  the VLAN the switch classified the frame into. The SDK hands a frame to
+  Linux only on that VLAN's interface; with 0 there it dropped everything,
+  and the switch got no DHCP lease and answered no ARP. OpenWrt does not
+  read the word, the other vendor firmwares do not mind it.
+
+OpenWrt, the Zyxel, the Teltonika and the HPE firmware pass their tests as
+before.
+
+### What Netgear's firmware lacks
+
+* The Insight cloud agent: `CloudAgent` restarts `xagent`, which exits with
+  status 255 straight away, three times a second, logging each time on the
+  console. It sends nothing on the network first; why it fails was not
+  found. The CLI works through it, with the log lines in between.
+* `ping` takes an IP address for a host name and answers `Invalid host name`;
+  a host name works (`ping time-a.netgear.com`, with the internet behind the
+  user network). Whether a real switch does the same has not been checked.
+* Port counters read zero, as they do under OpenWrt.
+* Only the GS108Tv3: the GS110TPv3 and the GS110TPP read other board IDs and
+  have PoE, and the GS110TPv3 two SFP ports, none of which the machine has.
+* Untested: firmware upgrade, the second image slot, `reboot` from the CLI,
+  SSH, SNMP, the web interface past its login page, LAGs, VLANs beyond the
+  default one, and spanning tree against another switch.
+
 ## How the image boots
 
 `images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
@@ -670,8 +802,9 @@ executing, so `rt-loader` runs exactly as it does on the real switch. From
 flash it does the same with the uImage at `0x260000`, see [Flash](#flash). ELF
 `vmlinux` files and raw kernels are also accepted, and so is a uImage whose
 payload is gzip'ed or LZMA-compressed, which is unpacked to its load address
-first: that is what the [Zyxel](#zyxel-firmware) and the
-[Teltonika](#teltonika-firmware) firmware are.
+first: that is what the [Zyxel](#zyxel-firmware), the
+[Teltonika](#teltonika-firmware) and the [Netgear](#netgear-firmware)
+firmware are, the last with a magic of its own, `NGE `.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
 the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
@@ -687,10 +820,10 @@ time by `scripts/sync.sh`.
 | Interrupt controller | `0x18003000` | 32 sources onto 5 outputs, wired to MIPS IP2..IP6 |
 | Otto timer | `0x18003100` | Five count-up timers; clocksource *and* clockevent |
 | Memory controller | `0x18001000` | Reports 128 MiB to both rt-loader and the kernel |
-| SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash); memory-mapped at `0x14000000` |
+| SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash), or 32 MiB for HPE's and Netgear's firmware; memory-mapped at `0x14000000` |
 | UART | `0x18002000` | 16550, reg-shift 2 |
 | Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
-| GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx |
+| GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx; an RTL8231 expander on two of them on the GS108Tv3 |
 | Switch core | `0x1b000000` | SoC ID, PLLs, thermal, table engine, MDIO, 8 PHYs |
 | CPU-port DMA | `0x1b009f00` | Two rings each way, 32-byte descriptors, 20-byte CPU tag |
 | Forwarding | `0x1b000000` | FDB, VLANs, spanning tree, isolation, flooding, RMA traps |
@@ -705,10 +838,12 @@ anything:
   the line status register for `0x20000000`, not `0x20`. That placement is how
   QEMU spells it. Get this wrong and the machine boots in complete silence.
 * **The CPU model is `rtl8380`**, added by `patches/rtl838x.patch`: QEMU's
-  `4KEc` with MIPS16e. The ASE is missing from QEMU's model but present in
-  the silicon, and OpenWrt compiles userspace for this target with MIPS16
-  instructions. Without it the kernel boots fine and then dies the instant it
-  executes `/init`. Because it's a static patch rather than derived from the
+  `4KEc` with MIPS16e and vectored interrupts. The ASE is missing from QEMU's
+  model but present in the silicon, and OpenWrt compiles userspace for this
+  target with MIPS16 instructions. Without it the kernel boots fine and then
+  dies the instant it executes `/init`. Vectored interrupts (`Config3.VInt`)
+  are what Netgear's kernel installs its interrupt handlers with; without
+  them it stops at a `BUG()` before the console is up. Because it's a static patch rather than derived from the
   tree, a future qemu rebase that reshapes the `4KEc` struct will need this
   patch regenerated by hand.
 * **Several registers must clear themselves.** Three are busy-waited on with
@@ -786,9 +921,11 @@ guest sees through the PHY is the backend's.
   has crossed the port.
 * Frames are forwarded at once and in order, with no queues, no shaping and no
   rate limiting, so anything measuring bandwidth or priority measures the host.
-* The RTL8231 GPIO expander on the bit-banged MDIO bus is absent, so the reset
-  button and the system LED do not exist.
-* The machine loads only the first image slot, at `0x260000` or `0xa0000`;
+* The RTL8231 GPIO expander on the bit-banged MDIO bus is there only on the
+  GS108Tv3, with its pins as inputs; elsewhere it is absent, and with it the
+  reset button and the system LED.
+* The machine loads only the first image slot, at `0x260000`, `0xa0000` or
+  `0x300000`;
   `bootpartition` in the U-Boot environment is not consulted. HPE's
   BootWare is not emulated at all.
 * There are no ACLs: the rules are stored, but nothing matches against them,
@@ -816,6 +953,8 @@ tests/test_stock.py the same for the Zyxel firmware, from a scratch flash and
 tests/test_tsw.py   the same for the Teltonika firmware, which test_stock.py
                     hands it
 tests/test_hpe.py   the same for HPE's firmware, which test_stock.py hands it
+tests/test_netgear.py the same for Netgear's firmware, which test_stock.py
+                    hands it
 qemu/               submodule, pinned to v11.1.1
 ```
 

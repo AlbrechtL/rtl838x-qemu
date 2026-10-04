@@ -442,7 +442,7 @@ static void fwd_egress(RTL838xSwitchState *s, uint32_t mask, unsigned src,
         }
 
         if (p == RTL838X_SW_CPU_PORT) {
-            rtl838x_eth_to_cpu(s, src, reason, frame, frame_len);
+            rtl838x_eth_to_cpu(s, src, reason, vid, frame, frame_len);
         } else {
             rtl838x_port_send(s->port[i], frame, frame_len);
         }
@@ -528,10 +528,14 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
         return;
     }
 
-    /* Trapped frames bypass the whole pipeline, spanning tree included. */
+    /*
+     * Trapped frames bypass the whole pipeline, spanning tree included, but
+     * still carry the VLAN they were classified into.
+     */
+    vid = fwd_classify(s, port, buf, len, &tagged, &pcp, &vlan_tagged);
     if (fwd_is_trapped(buf, len)) {
         fwd_dbg("port %u: trapped to CPU\n", port);
-        rtl838x_eth_to_cpu(s, port, FWD_REASON_TRAP, buf, len);
+        rtl838x_eth_to_cpu(s, port, FWD_REASON_TRAP, vid, buf, len);
         return;
     }
 
@@ -541,7 +545,6 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
         return;
     }
 
-    vid = fwd_classify(s, port, buf, len, &tagged, &pcp, &vlan_tagged);
     if (!fwd_port_admits(s, port, vlan_tagged)) {
         fwd_dbg("port %u: dropped, does not admit %s frames\n",
                 port, vlan_tagged ? "tagged" : "untagged");
@@ -553,7 +556,7 @@ void rtl838x_fwd_ingress(RTL838xSwitchState *s, unsigned port,
         case FWD_IGR_FORWARD:
             break;      /* filtering off: it goes where its VLAN goes */
         case FWD_IGR_TRAP:
-            rtl838x_eth_to_cpu(s, port, FWD_REASON_TRAP, buf, len);
+            rtl838x_eth_to_cpu(s, port, FWD_REASON_TRAP, vid, buf, len);
             return;
         default:
             fwd_dbg("port %u: dropped, not a member of vlan %u (members 0x%08x)\n",

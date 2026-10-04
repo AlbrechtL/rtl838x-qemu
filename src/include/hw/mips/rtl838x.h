@@ -47,13 +47,14 @@
  * property overrides, and where in it the stock bootloaders look for the
  * uImage they boot.  0x260000 is the GS1900's first image slot, the one
  * "bootpartition=0" selects and the device tree's "firmware" partition
- * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts.
+ * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts, and
+ * 0x300000 the Netgear GS108Tv3's "RUNTIME".
  */
 #define RTL838X_FLASH_TYPE      "mx25l12855e"
-#define RTL838X_FLASH_TYPE_HPE  "mx25l25635e"   /* 32 MiB, the HPE 1920's */
-#define RTL838X_FLASH_SIZE      (16 * 1024 * 1024)
+#define RTL838X_FLASH_TYPE_32M  "mx25l25635e"   /* the HPE 1920's, GS108Tv3's */
 #define RTL838X_FLASH_FIRMWARE  0x260000
 #define RTL838X_FLASH_FIRMWARE_TSW 0x0a0000
+#define RTL838X_FLASH_FIRMWARE_NETGEAR 0x300000
 /* The SPI controller's window onto the flash, 0xb4000000 through KSEG1. */
 #define RTL838X_FLASH_WINDOW    0x14000000
 
@@ -106,8 +107,18 @@ struct RTL838xIntcState {
 
 /* GPIO controller. */
 #define TYPE_RTL838X_GPIO "rtl838x-gpio"
+OBJECT_DECLARE_SIMPLE_TYPE(RTL838xGpioState, RTL838X_GPIO)
 /* Every line: the TSW2xx's I2C buses, SFP cage signals and reset button. */
 #define RTL838X_GPIO_TSW_PULLUPS 0xffffffffu
+/* The GS108Tv3's reset button, line 0 (A0), active low. */
+#define RTL838X_GPIO_GS108TV3_PULLUPS (1u << 24)
+/*
+ * What the GS108Tv3's RTL8231 pins read as inputs: high, as pulled up,
+ * but for the board ID Netgear's firmware reads its model from.  Pins
+ * 0..3 are bits 1, 0, 2 and 3 of it: 1 is the GS108Tv3, 3 the GS110TPv3,
+ * 15 the GS110TPP.
+ */
+#define RTL838X_RTL8231_GS108TV3 (0x1fffffffffull & ~0xdull)
 
 /* Watchdog. */
 #define TYPE_RTL838X_WDT "rtl838x-wdt"
@@ -187,6 +198,9 @@ struct RTL838xSwitchState {
     /* Front-panel ports, indexed from RTL838X_SW_PORT_FIRST. */
     RTL838xPortState *port[RTL838X_SW_NUM_PORTS];
 
+    /* The GPIO controller, which may have an RTL8231 on its lines. */
+    RTL838xGpioState *gpio;
+
     /* Where the DMA engine left off in each ring, in entries. */
     uint32_t rx_cursor[RTL838X_ETH_RX_RINGS];
     uint32_t tx_cursor[RTL838X_ETH_TX_RINGS];
@@ -207,6 +221,12 @@ bool rtl838x_switch_link_up(RTL838xSwitchState *s, unsigned port);
 uint32_t *rtl838x_switch_table_row(RTL838xSwitchState *s, unsigned window,
                                    unsigned type, uint32_t index);
 
+/* rtl838x_gpio.c: the RTL8231, which the switch's own engine reaches too. */
+bool rtl838x_gpio_has_rtl8231(RTL838xGpioState *s);
+uint16_t rtl838x_gpio_rtl8231_read(RTL838xGpioState *s, unsigned reg);
+void rtl838x_gpio_rtl8231_write(RTL838xGpioState *s, unsigned reg,
+                                uint16_t val);
+
 /* rtl838x_port.c */
 bool rtl838x_port_link_up(RTL838xPortState *p);
 void rtl838x_port_send(RTL838xPortState *p, const uint8_t *buf, size_t len);
@@ -216,7 +236,8 @@ bool rtl838x_eth_write(RTL838xSwitchState *s, hwaddr addr, uint32_t val);
 bool rtl838x_eth_read(RTL838xSwitchState *s, hwaddr addr, uint32_t *val);
 void rtl838x_eth_reset(RTL838xSwitchState *s);
 void rtl838x_eth_to_cpu(RTL838xSwitchState *s, unsigned src_port,
-                        unsigned reason, const uint8_t *buf, size_t len);
+                        unsigned reason, uint16_t vid, const uint8_t *buf,
+                        size_t len);
 
 /* rtl838x_fwd.c: the forwarding engine. */
 void rtl838x_fwd_realize(RTL838xSwitchState *s);

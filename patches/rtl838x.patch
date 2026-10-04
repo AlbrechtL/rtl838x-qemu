@@ -37,8 +37,8 @@ index cc19162..3aaf847 100644
      },
 +
 +    /*
-+     * Realtek RTL8380M: a 4KEc core with MIPS16e, which OpenWrt
-+     * userspace for this SoC is compiled to use.
++     * Realtek RTL8380M: a 4KEc core with MIPS16e, which OpenWrt userspace
++     * uses, and vectored interrupts, which Netgear's kernel does.
 +     */
 +    {
 +        .name = "rtl8380",
@@ -50,7 +50,7 @@ index cc19162..3aaf847 100644
 +                       (0 << CP0C1_DS) | (3 << CP0C1_DL) | (1 << CP0C1_DA) |
 +                       (0 << CP0C1_CA),
 +        .CP0_Config2 = MIPS_CONFIG2,
-+        .CP0_Config3 = MIPS_CONFIG3 | (0 << CP0C3_VInt),
++        .CP0_Config3 = MIPS_CONFIG3 | (1 << CP0C3_VInt),
 +        .CP0_LLAddr_rw_bitmask = 0,
 +        .CP0_LLAddr_shift = 4,
 +        .SYNCI_Step = 32,
