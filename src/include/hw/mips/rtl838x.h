@@ -47,14 +47,16 @@
  * property overrides, and where in it the stock bootloaders look for the
  * uImage they boot.  0x260000 is the GS1900's first image slot, the one
  * "bootpartition=0" selects and the device tree's "firmware" partition
- * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts, and
- * 0x300000 the Netgear GS108Tv3's "RUNTIME".
+ * starts at; 0xa0000 is where the Teltonika TSW2xx's "firmware" starts,
+ * 0x300000 the Netgear GS108Tv3's "RUNTIME" and 0x2a0000 the ALLNET
+ * ALL-SG8208M's, whose bootloader is twice the GS1900's.
  */
 #define RTL838X_FLASH_TYPE      "mx25l12855e"
 #define RTL838X_FLASH_TYPE_32M  "mx25l25635e"   /* the HPE 1920's, GS108Tv3's */
 #define RTL838X_FLASH_FIRMWARE  0x260000
 #define RTL838X_FLASH_FIRMWARE_TSW 0x0a0000
 #define RTL838X_FLASH_FIRMWARE_NETGEAR 0x300000
+#define RTL838X_FLASH_FIRMWARE_ALLNET 0x2a0000
 /* The SPI controller's window onto the flash, 0xb4000000 through KSEG1. */
 #define RTL838X_FLASH_WINDOW    0x14000000
 
@@ -119,6 +121,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RTL838xGpioState, RTL838X_GPIO)
  * 15 the GS110TPP.
  */
 #define RTL838X_RTL8231_GS108TV3 (0x1fffffffffull & ~0xdull)
+/*
+ * The ALL-SG8208M's: all high.  ALLNET's firmware reads its reset button
+ * from pin 3, and restores its factory defaults when that reads low.
+ */
+#define RTL838X_RTL8231_ALLNET 0x1fffffffffull
 
 /* Watchdog. */
 #define TYPE_RTL838X_WDT "rtl838x-wdt"

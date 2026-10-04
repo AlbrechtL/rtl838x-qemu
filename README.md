@@ -9,7 +9,8 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
 Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx,
-HPE's Comware for the 1920-8G and Netgear's firmware for the GS108Tv3 all run;
+HPE's Comware for the 1920-8G, Netgear's firmware for the GS108Tv3 and
+ALLNET's for the ALL-SG8208M all run;
 see [Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
@@ -57,6 +58,9 @@ no kernel oops or unhandled faults       PASS
 * [Netgear firmware](#netgear-firmware)
   * [What Netgear's firmware needed](#what-netgears-firmware-needed)
   * [What Netgear's firmware lacks](#what-netgears-firmware-lacks)
+* [ALLNET firmware](#allnet-firmware)
+  * [What ALLNET's firmware needed](#what-allnets-firmware-needed)
+  * [What ALLNET's firmware lacks](#what-allnets-firmware-lacks)
 * [How the image boots](#how-the-image-boots)
 * [What is modelled](#what-is-modelled)
 * [How the data path works](#how-the-data-path-works)
@@ -76,6 +80,7 @@ no kernel oops or unhandled faults       PASS
 | Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
 | HPE Comware 5.20.99 Release 1121 ([download](https://h30326.www3.hpe.com/hpn/1920-8G-JG920A_5.20.R1121.zip?merchantId=ASP_DROPBOX)) | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
 | Netgear 7.1.1.12 ([download](https://www.downloads.netgear.com/files/GDC/GS108Tv3/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip)) | Netgear GS108Tv3, GS110TPv3, GS110TPP v1; run as a GS108Tv3 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Netgear firmware](#netgear-firmware) |
+| ALLNET 2.2.1.2959 ([download](https://www.allnet.de/ftp-downloads/allnet/switches/all-sg8208m/all-sg8208m-version_2.2.1_vmlinux.bix.zip)) | ALLNET ALL-SG8208M | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [ALLNET firmware](#allnet-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
@@ -101,7 +106,8 @@ Other commands: `run-log` (adds `-d unimp,guest_errors` into `out/qemu.log`),
 `shell` (a shell in the build container), `info` and `dts` (inspect the
 firmware image), `mkflash`, `run-flash` and `test-stock` (for the
 [Zyxel](#zyxel-firmware), [Teltonika](#teltonika-firmware),
-[HPE](#hpe-firmware) and [Netgear](#netgear-firmware) firmware),
+[HPE](#hpe-firmware), [Netgear](#netgear-firmware) and
+[ALLNET](#allnet-firmware) firmware),
 `clean`, `distclean`, `help`.
 
 `run`, `run-log`, `test`, `info` and `dts` take the image as their first
@@ -180,8 +186,9 @@ tr '\000' '\377' < /dev/zero | head -c 16M > flash.bin
 With a flash and no `-kernel`, the machine does what the stock bootloader does
 with `bootpartition=0`: it loads the uImage at `0x260000`, the start of the
 first image slot, and starts it -- or, with nothing there, the one at
-`0xa0000`, where the TSW2xx keeps its firmware, or the one at `0x300000`,
-where the GS108Tv3 does. It does so on every reset, so
+`0xa0000`, where the TSW2xx keeps its firmware, the one at `0x300000`,
+where the GS108Tv3 does, or the one at `0x2a0000`, where the ALL-SG8208M
+does. It does so on every reset, so
 after an upgrade the reboot starts the new firmware. With `-kernel`, the
 kernel is booted instead, on every reset too, and the flash is just there to
 be installed to -- the way a TFTP-booted initramfs installs a firmware on the
@@ -198,8 +205,8 @@ qemu-system-mips -M rtl838x -m 128 -nographic \
 The bootloader also programs the switch's MAC address registers with
 `ethaddr` from its environment, and the firmware takes its address from there.
 The machine does the same when the flash holds an environment with one, at
-`0x40000` as on the GS1900, `0x80000` as on the TSW2xx or `0xe0000` as on the
-GS108Tv3; otherwise the address
+`0x40000` as on the GS1900, `0x80000` as on the TSW2xx and the ALL-SG8208M,
+or `0xe0000` as on the GS108Tv3; otherwise the address
 is a random one, fixed for the life of the QEMU process.
 
 `-drive if=mtd,...,snapshot=on` keeps every write in a temporary file instead,
@@ -209,7 +216,7 @@ QEMU still sees the writes.
 Which chip the flash identifies as is the machine's `flash-model` property,
 any 16 MiB part QEMU's `m25p80` models: `-machine flash-model=mx25l12805d`
 gives the JEDEC ID of the chip that is actually soldered to the board, which
-is the only one the Zyxel firmware accepts.
+is the only one the Zyxel and ALLNET firmware accept.
 
 ## Zyxel firmware
 
@@ -786,6 +793,122 @@ before.
   SSH, SNMP, the web interface past its login page, LAGs, VLANs beyond the
   default one, and spanning tree against another switch.
 
+## ALLNET firmware
+
+ALLNET's ALL-SG8208M is an RTL8380M with eight copper ports, a 16 MiB flash
+and an RTL8231 GPIO expander. It comes from the ODM behind the GS1900, and so
+does its firmware: Zyxel's, down to the Linux 2.6.19 kernel, the CLI and the
+web interface, with ALLNET's name on it.
+
+The firmware is not in this repository. Tested is 2.2.1.2959,
+`all-sg8208m-version_2.2.1_vmlinux.bix.zip`, from
+<https://www.allnet.de/ftp-downloads/allnet/switches/all-sg8208m/all-sg8208m-version_2.2.1_vmlinux.bix.zip>
+(download page:
+<https://www.allnet.de/nc/en/allnet-brand/support/treiber-firmware/download/112533/>);
+the zip can be used as it is, the tools take the `.bix` out of it.
+
+```sh
+./rtl838x.sh mkflash images/all-sg8208m-version_2.2.1_vmlinux.bix.zip allnet.bin
+./rtl838x.sh run-flash allnet.bin -machine flash-model=mx25l12805d \
+    -nic user,net=192.168.1.0/24,host=192.168.1.2,dhcpstart=192.168.1.1,hostfwd=tcp::8080-192.168.1.1:80
+```
+
+The machine finds the image at `0x2a0000`, takes it for ALLNET's, and gives
+the board its RTL8231. The flash wants the same chip as Zyxel's firmware, hence
+`flash-model`. `mkflash` writes the flash in the ALL-SG8208M's layout, which
+is the GS1900's with every partition 256 KiB further up behind a bootloader
+twice the size:
+
+| Offset | Partition | Content |
+|---|---|---|
+| `0x000000` | `LOADER` | Erased, but for a placeholder U-Boot version string, `U-Boot 2011.12.(0.0.0)`, which `show version` searches for and fails without. It reads it as `0.0.0`. |
+| `0x080000` | `BDINFO` | The GS1900's U-Boot environment. `--bdinfo name=value` adds to it. |
+| `0x090000` | `SYSINFO` | The second environment, as on the GS1900. `--sysinfo name=value` adds to it. |
+| `0x0a0000` | `JFFS2 CFG`, `JFFS2 LOG` | Erased. The firmware formats them on first boot. |
+| `0x2a0000` | `RUNTIME` | The `.bix`, byte for byte. |
+| `0x950000` | `RUNTIME2` | Erased. |
+
+About a minute later:
+
+```
+Probe: SPI CS1 Flash Type MX25L12845E
+Creating 7 MTD partitions on "Total SPI FLASH":
+0x00000000-0x00080000 : "LOADER"
+...
+0x002a0000-0x00950000 : "RUNTIME"
+0x00950000-0x01000000 : "RUNTIME2"
+...
+Got it bingo! just button default reset reboot!
+...
+Press any key to continue
+Username: admin
+Password: *****
+Switch# show version
+Loader Version   : 0.0.0
+Loader Date      : Jan 01 2000 - 00:00:00
+Firmware Version : 2.2.1.2959
+Firmware Date    : May 21 2018 - 14:34:36
+Switch# show interfaces GigabitEthernet 1-8 status
+Port  Name                 Status      Vlan  Duplex  Speed    Type
+gi1                        connected   1     a-full  a-1000M  Copper
+gi2                        notconnect  1     auto    auto     Copper
+...
+```
+
+The account is `admin` / `admin`. Despite the console, nothing is reset or
+rebooted: ALLNET's first-boot hook prints the "bingo" line whenever there is no
+`startup-config` yet, and only applies its own defaults. The board LED line
+says `24G+4SFP Switch` whatever the board. As with Zyxel's, the firmware asks
+for an address over DHCP and falls back to 192.168.1.1, so the user network
+above leases it that address and the web interface is on
+<http://localhost:8080>.
+
+```
+$ ./rtl838x.sh test-stock images/all-sg8208m-version_2.2.1_vmlinux.bix.zip
+the vendor kernel finds the flash        PASS
+the vendor partition map is created      PASS
+reaches the vendor CLI                   PASS
+logs in with the factory account         PASS
+show version names the firmware          PASS
+the three cabled ports are connected     PASS
+the uncabled ports are not               PASS
+the switch answers an arp for its address PASS
+port 1 to port 2 is switched in hardware PASS
+a frame is not reflected to its source   PASS
+the switch pings a host on port 3        PASS
+the web interface answers                PASS
+the configuration is saved to flash      PASS
+no factory reset from the reset button   PASS
+no kernel oops or fatal signals          PASS
+```
+
+### What ALLNET's firmware needed
+
+* **Its magic.** The `.bix` is the Zyxel image with `0x00000006` for a
+  magic, around the same gzip'ed kernel for `0x80000000`. So weak a magic is
+  only taken with a header CRC that checks out.
+* **Its flash layout.** With the image in the GS1900's slot, the firmware
+  found its environments and JFFS2 partitions 256 KiB off, failed to mount
+  them, and lost its configuration on every boot.
+* **The RTL8231, and the reset button on it.** The board module picks the
+  8-port model itself; the SDK then sets up an RTL8231 by bit-banging MDIO on
+  GPIO lines A2 and A3 (`Initial SMI driver failed` four times without it)
+  and polls the reset button on its pin 3, active low. Read as 0, the
+  firmware took it for held, restored its factory defaults and rebooted on
+  every boot. The machine has the expander, as for Netgear's firmware, with
+  every pin high.
+
+OpenWrt, the Zyxel, the Teltonika, the HPE and the Netgear firmware pass their
+tests as before.
+
+### What ALLNET's firmware lacks
+
+What [Zyxel's](#what-does-not-work) lacks: the MAC address table shows only the
+switch's own address, and port counters read zero. Untested: firmware upgrade,
+the second image slot, `reboot` from the CLI, SSH, SNMP, the web interface
+past its front page, LAGs, VLANs beyond the default one, and spanning tree
+against another switch.
+
 ## How the image boots
 
 `images/…-initramfs-kernel.bin` is not a plain kernel. `./rtl838x.sh info` breaks
@@ -803,8 +926,9 @@ flash it does the same with the uImage at `0x260000`, see [Flash](#flash). ELF
 `vmlinux` files and raw kernels are also accepted, and so is a uImage whose
 payload is gzip'ed or LZMA-compressed, which is unpacked to its load address
 first: that is what the [Zyxel](#zyxel-firmware), the
-[Teltonika](#teltonika-firmware) and the [Netgear](#netgear-firmware)
-firmware are, the last with a magic of its own, `NGE `.
+[Teltonika](#teltonika-firmware), the [Netgear](#netgear-firmware) and the
+[ALLNET](#allnet-firmware) firmware are, the last two with magics of their
+own, `NGE ` and `0x00000006`.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
 the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
@@ -948,8 +1072,8 @@ docker/             build container and slim runtime container
 tests/test_boot.py  boots the image and checks it over the serial console,
                     including the data path, by plugging a socket netdev into
                     lan1 and lan2 and speaking Ethernet at them
-tests/test_stock.py the same for the Zyxel firmware, from a scratch flash and
-                    through the vendor CLI
+tests/test_stock.py the same for the Zyxel and ALLNET firmware, from a
+                    scratch flash and through the vendor CLI
 tests/test_tsw.py   the same for the Teltonika firmware, which test_stock.py
                     hands it
 tests/test_hpe.py   the same for HPE's firmware, which test_stock.py hands it

@@ -17,6 +17,9 @@ Teltonika's RutOS for the TSW2xx is an OpenWrt sysupgrade image: a uImage
 with the standard magic around an LZMA kernel (device tree appended, no
 rt-loader), then the squashfs root filesystem, then a signature trailer.
 
+ALLNET's firmware for the ALL-SG8208M, from the ODM behind the GS1900, is the
+Zyxel image again with 0x00000006 for a magic.
+
 Netgear's firmware for the GS108Tv3, GS110TPv3 and GS110TPP is a uImage with
 its own magic, "NGE ", around an LZMA kernel with its root file system
 inside; Realtek's SDK again, on Linux 3.18.
@@ -33,7 +36,8 @@ the application a 7-Zip archive around one LZMA-compressed raw image for
     unzip          write out the firmware file inside a vendor's zip
     mkflash        build a 16 MiB flash image with the firmware installed and
                    the two U-Boot environments the vendor firmware reads; for
-                   Netgear's, the same in its 32 MiB layout; for HPE's
+                   ALLNET's, the same in its layout; for Netgear's, in its
+                   32 MiB one; for HPE's
                    firmware, a 32 MiB flash with a MAC address in it
 """
 
@@ -50,6 +54,7 @@ import zlib
 UIMAGE_MAGIC = 0x27051956
 RTL_MAGIC = 0x83800000
 NETGEAR_MAGIC = 0x4e474520     # "NGE "
+ALLNET_MAGIC = 0x00000006
 HDR_LEN = 64
 
 COMP_GZIP = 1
@@ -62,6 +67,12 @@ FLASH_SYSINFO = 0x50000     # second environment ("u-boot-env2")
 FLASH_ENV_SIZE = 0x10000
 FLASH_FIRMWARE = 0x260000   # first image slot
 FLASH_FIRMWARE2 = 0x930000  # second image slot, where the vendor layout puts it
+
+# The ALLNET ALL-SG8208M's flash: the GS1900's partitions, all of them 256 KiB
+# further up behind a bootloader twice the size.
+ALLNET_BDINFO = 0x80000
+ALLNET_SYSINFO = 0x90000
+ALLNET_FIRMWARE = 0x2a0000
 
 # The Teltonika TSW2xx's flash: the same chip, laid out differently.
 TSW_UBOOT_ENV = 0x80000     # "u-boot-env"
@@ -130,6 +141,9 @@ DEFAULT_TSW_MNFINFO = {
 # string and fails "show version" without one.  It reads this placeholder as
 # version 0.0.0, built on the date in the brackets.
 LOADER_STUB = b"U-Boot 0.0-svn0 (Jan 01 2000 - 00:00:00)\0"
+# ALLNET's looks for the Realtek SDK's U-Boot 2011.12 instead, and takes the
+# version from the brackets after it: 0.0.0 here.
+ALLNET_LOADER_STUB = b"U-Boot 2011.12.(0.0.0) (Jan 01 2000 - 00:00:00)\0"
 
 COMPRESSION = {0: "none", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo", 5: "lz4", 6: "zstd"}
 
@@ -162,8 +176,13 @@ class Image:
          self.dcrc) = struct.unpack(">7I", data[:28])
         self.os, self.arch, self.type, self.comp = data[28:32]
         self.name = data[32:64].rstrip(b"\0").decode("ascii", "replace")
-        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, NETGEAR_MAGIC):
+        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, NETGEAR_MAGIC,
+                              ALLNET_MAGIC):
             raise ValueError(f"not a uImage: magic 0x{self.magic:08x}")
+        # ALLNET's magic is too weak to go by alone.
+        if (self.magic == ALLNET_MAGIC and
+                zlib.crc32(data[:4] + bytes(4) + data[8:HDR_LEN]) != self.hcrc):
+            raise ValueError("not a uImage: magic 0x00000006, bad header CRC")
 
     @property
     def payload(self):
@@ -221,6 +240,10 @@ class Image:
     def is_netgear(self):
         """Whether this is Netgear's firmware, by its magic."""
         return self.magic == NETGEAR_MAGIC
+
+    def is_allnet(self):
+        """Whether this is ALLNET's firmware, by its magic."""
+        return self.magic == ALLNET_MAGIC
 
     def is_tsw(self):
         """Whether this is Teltonika's firmware for the TSW2xx."""
@@ -319,6 +342,9 @@ class Comware:
         return False
 
     def is_netgear(self):
+        return False
+
+    def is_allnet(self):
         return False
 
 
@@ -437,14 +463,19 @@ def mkflash_netgear(data, bdinfo, sysinfo):
     return bytes(flash)
 
 
-def mkflash(data, bdinfo, sysinfo):
-    if len(data) > FLASH_SIZE - FLASH_FIRMWARE:
+def mkflash(data, bdinfo, sysinfo, allnet=False):
+    """The GS1900's layout, or with allnet the ALL-SG8208M's."""
+    bdinfo_off, sysinfo_off, firmware_off = (
+        (ALLNET_BDINFO, ALLNET_SYSINFO, ALLNET_FIRMWARE) if allnet
+        else (FLASH_BDINFO, FLASH_SYSINFO, FLASH_FIRMWARE))
+    if len(data) > FLASH_SIZE - firmware_off:
         raise ValueError("image does not fit the flash")
     flash = bytearray(b"\xff" * FLASH_SIZE)
-    flash[0:len(LOADER_STUB)] = LOADER_STUB
-    flash[FLASH_BDINFO:FLASH_BDINFO + FLASH_ENV_SIZE] = uboot_env(bdinfo)
-    flash[FLASH_SYSINFO:FLASH_SYSINFO + FLASH_ENV_SIZE] = uboot_env(sysinfo)
-    flash[FLASH_FIRMWARE:FLASH_FIRMWARE + len(data)] = data
+    loader = ALLNET_LOADER_STUB if allnet else LOADER_STUB
+    flash[0:len(loader)] = loader
+    flash[bdinfo_off:bdinfo_off + FLASH_ENV_SIZE] = uboot_env(bdinfo)
+    flash[sysinfo_off:sysinfo_off + FLASH_ENV_SIZE] = uboot_env(sysinfo)
+    flash[firmware_off:firmware_off + len(data)] = data
     return bytes(flash)
 
 
@@ -493,8 +524,10 @@ def main():
             sysinfo = dict(DEFAULT_SYSINFO)
             for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
                 env.update(v.split("=", 1) for v in given)
-            flash = (mkflash_netgear if img.is_netgear() else mkflash)(
-                img.data, bdinfo, sysinfo)
+            if img.is_netgear():
+                flash = mkflash_netgear(img.data, bdinfo, sysinfo)
+            else:
+                flash = mkflash(img.data, bdinfo, sysinfo, img.is_allnet())
         open(args.output, "wb").write(flash)
         print(f"wrote {len(flash)} bytes to {args.output}", file=sys.stderr)
         return
@@ -519,7 +552,8 @@ def main():
 
     if args.command == "info":
         vendor = {RTL_MAGIC: " (vendor magic)",
-                  NETGEAR_MAGIC: " (Netgear)"}.get(img.magic, "")
+                  NETGEAR_MAGIC: " (Netgear)",
+                  ALLNET_MAGIC: " (ALLNET)"}.get(img.magic, "")
         print(f"magic       0x{img.magic:08x}{vendor}")
         print(f"name        {img.name}")
         print(f"size        {img.size} bytes")

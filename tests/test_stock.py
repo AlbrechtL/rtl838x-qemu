@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Boot the vendor (Zyxel) firmware under the rtl838x machine and check it.
 
+ALLNET's for the ALL-SG8208M is the same firmware from the same ODM, with its
+own prompt, account and port names, and gets the same checks.
+
 The vendor firmware boots from flash, so the image is installed into a
 scratch flash first, the way "./rtl838x.sh mkflash" does it, and the machine
 is started without -kernel.  Everything after that goes through the vendor
@@ -28,7 +31,15 @@ from test_boot import Console, Wire, arp, check, is_arp_reply  # noqa: E402
 # The chip the vendor kernel's flash driver knows the real one as.
 FLASH_MODEL = "mx25l12805d"
 
-PROMPT = r"GS1900# "
+# What differs between Zyxel's CLI and ALLNET's.
+ZYXEL = {"prompt": r"GS1900# ", "password": "1234",
+         "status": "show interfaces 1-8 status", "port": "",
+         "version": r"Firmware Version +: V\d+\.\d+\("}
+ALLNET = {"prompt": r"Switch# ", "password": "admin",
+          "status": "show interfaces GigabitEthernet 1-8 status", "port": "gi",
+          "version": r"Firmware Version +: \d+\.\d+\.\d+"}
+
+PROMPT = ZYXEL["prompt"]
 SWITCH_IP = "192.168.1.1"       # the firmware's factory default
 HOST_IP = "192.168.1.2"         # QEMU's user network, as seen from the switch
 
@@ -95,9 +106,13 @@ def main():
         import test_netgear
         return test_netgear.run(args)
 
+    global PROMPT
+    cli_of = ALLNET if image.is_allnet() else ZYXEL
+    PROMPT = cli_of["prompt"]
+
     flash = tempfile.NamedTemporaryFile(prefix="rtl838x-flash-", suffix=".bin")
     flash.write(imgtool.mkflash(image.data, imgtool.DEFAULT_BDINFO,
-                                imgtool.DEFAULT_SYSINFO))
+                                imgtool.DEFAULT_SYSINFO, image.is_allnet()))
     flash.flush()
 
     # lan1 and lan2 are cables this test holds the other end of, lan3 is
@@ -139,26 +154,27 @@ def main():
         con.expect(r"Username: ", 60)
         send(con, "admin")
         con.expect(r"Password: ", 60)
-        send(con, "1234")
+        send(con, cli_of["password"])
         con.expect(PROMPT, 60)
         print("%-40s PASS" % "logs in with the factory account")
 
         version = cli(con, "show version")
         tests.append(check("show version names the firmware",
-                           re.search(r"Firmware Version +: V\d+\.\d+\(",
-                                     version) is not None, version.strip()))
+                           re.search(cli_of["version"], version) is not None,
+                           version.strip()))
 
         # The firmware only looks at a port once it has been told the link
         # changed, and then takes a moment to act on it.
         status = ""
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            status = cli(con, "show interfaces 1-8 status")
+            status = cli(con, cli_of["status"])
             if len(re.findall(r"connected +\d+ +a-full +a-1000M", status)) == 3:
                 break
             time.sleep(3)
         rows = {int(m.group(1)): m.group(2) for m in
-                re.finditer(r"^(\d) +(\S+)", status, re.M)}
+                re.finditer(r"^%s(\d) +(\S+)" % cli_of["port"], status,
+                            re.M)}
         tests.append(check("the three cabled ports are connected",
                            [rows.get(p) for p in (1, 2, 3)] == ["connected"] * 3
                            and status.count("a-1000M") == 3, status.strip()))
@@ -204,6 +220,11 @@ def main():
                            "startup-config" in files,
                            (saved + files).strip()))
 
+        # ALLNET's firmware restores its factory defaults and reboots when it
+        # reads its reset button as held.
+        tests.append(check("no factory reset from the reset button",
+                           "Restore Factory Default" not in con.buf,
+                           "see the console output"))
         tests.append(check("no kernel oops or fatal signals",
                            not re.search(r"Oops|SIGSEGV|Kernel panic",
                                          con.buf + version + status + ping),

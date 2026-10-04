@@ -66,11 +66,14 @@
  * kernel, which the bootloader, and so this machine, inflates.  Teltonika's
  * RutOS images are a plain uImage around an LZMA kernel, with no rt-loader,
  * and get the same treatment.  Netgear's smart switches have a magic of
- * their own, "NGE " for the GS108Tv3 family, around an LZMA kernel.
+ * their own, "NGE " for the GS108Tv3 family, around an LZMA kernel.  ALLNET's
+ * ALL-SG8208M, built by the same ODM as the GS1900-8, has 0x00000006 around
+ * the same gzip'ed kernel.
  */
 #define UIMAGE_MAGIC        0x27051956
 #define UIMAGE_MAGIC_RTL    0x83800000
 #define UIMAGE_MAGIC_NGE    0x4e474520
+#define UIMAGE_MAGIC_ALLNET 0x00000006
 #define UIMAGE_HEADER_SIZE  64
 #define UIMAGE_COMP_NONE    0
 #define UIMAGE_COMP_GZIP    1
@@ -125,8 +128,8 @@ static const uint8_t sz_lzma_id[3] = { 0x03, 0x01, 0x01 };
 
 /*
  * Where the stock bootloaders keep their environment: the GS1900's at
- * 0x40000, the TSW2xx's at 0x80000, the GS108Tv3's at 0xe0000.  64 KiB
- * each, a CRC32 of the rest first.
+ * 0x40000, the TSW2xx's and the ALL-SG8208M's at 0x80000, the GS108Tv3's at
+ * 0xe0000.  64 KiB each, a CRC32 of the rest first.
  */
 #define UBOOT_ENV_SIZE      0x10000
 static const uint32_t uboot_env_offsets[] = { 0x40000, 0x80000, 0xe0000 };
@@ -201,12 +204,25 @@ static uint32_t be32_at(const uint8_t *p)
            ((uint32_t)p[2] << 8) | p[3];
 }
 
+/*
+ * ALLNET's magic is too weak to go by alone, so its header has to check out
+ * as well: the CRC over the header with the CRC field zeroed.
+ */
 static bool rtl838x_is_uimage(const uint8_t *hdr)
 {
     uint32_t magic = be32_at(hdr);
+    uint8_t copy[UIMAGE_HEADER_SIZE];
 
-    return magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL ||
-           magic == UIMAGE_MAGIC_NGE;
+    if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL ||
+        magic == UIMAGE_MAGIC_NGE) {
+        return true;
+    }
+    if (magic != UIMAGE_MAGIC_ALLNET) {
+        return false;
+    }
+    memcpy(copy, hdr, sizeof(copy));
+    memset(copy + 4, 0, 4);
+    return crc32(0, copy, sizeof(copy)) == be32_at(hdr + 4);
 }
 
 /*
@@ -324,15 +340,15 @@ static uint8_t *rtl838x_unpack_uimage(const uint8_t *hdr, const uint8_t *payload
 
 /*
  * Where in the flash the firmware is: the GS1900's first image slot, else
- * the TSW2xx's, else the GS108Tv3's, with its uImage header in hdr.  0 if
- * none holds one.
+ * the TSW2xx's, else the GS108Tv3's, else the ALL-SG8208M's, with its uImage
+ * header in hdr.  0 if none holds one.
  */
 static uint32_t rtl838x_flash_slot(BlockBackend *blk,
                                    uint8_t hdr[UIMAGE_HEADER_SIZE])
 {
     static const uint32_t slots[] = {
         RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
-        RTL838X_FLASH_FIRMWARE_NETGEAR,
+        RTL838X_FLASH_FIRMWARE_NETGEAR, RTL838X_FLASH_FIRMWARE_ALLNET,
     };
 
     for (unsigned i = 0; i < ARRAY_SIZE(slots); i++) {
@@ -365,10 +381,11 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 
     slot = rtl838x_flash_slot(blk, hdr);
     if (!slot) {
-        error_setg(errp, "no uImage in flash at 0x%x, 0x%x or 0x%x: nothing "
-                   "to boot; install a firmware first, or boot one with "
-                   "-kernel", RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
-                   RTL838X_FLASH_FIRMWARE_NETGEAR);
+        error_setg(errp, "no uImage in flash at 0x%x, 0x%x, 0x%x or 0x%x: "
+                   "nothing to boot; install a firmware first, or boot one "
+                   "with -kernel", RTL838X_FLASH_FIRMWARE,
+                   RTL838X_FLASH_FIRMWARE_TSW, RTL838X_FLASH_FIRMWARE_NETGEAR,
+                   RTL838X_FLASH_FIRMWARE_ALLNET);
         return 0;
     }
     size = rtl838x_check_uimage(hdr, blk_getlength(blk) - slot, "flash",
@@ -641,6 +658,7 @@ static void rtl838x_init(MachineState *machine)
     size_t app_len;
     bool hpe = false;
     bool netgear = false;
+    bool allnet = false;
     uint32_t flash_slot = 0;
     MACAddr mac;
     MIPSCPU *cpu;
@@ -665,12 +683,15 @@ static void rtl838x_init(MachineState *machine)
                                   &app_len) != NULL;
         netgear = kernel_len >= UIMAGE_HEADER_SIZE &&
                   be32_at((const uint8_t *)kernel) == UIMAGE_MAGIC_NGE;
+        allnet = kernel_len >= UIMAGE_HEADER_SIZE &&
+                 be32_at((const uint8_t *)kernel) == UIMAGE_MAGIC_ALLNET &&
+                 rtl838x_is_uimage((const uint8_t *)kernel);
     }
 
     /*
      * Then the flash: which slot holds a firmware says which board this is
      * when there is no kernel.  The firmware where the TSW2xx keeps it makes
-     * a TSW2xx; Netgear's makes a GS108Tv3.
+     * a TSW2xx; Netgear's makes a GS108Tv3, and ALLNET's an ALL-SG8208M.
      */
     flash_dinfo = drive_get(IF_MTD, 0, 0);
     if (flash_dinfo) {
@@ -679,6 +700,7 @@ static void rtl838x_init(MachineState *machine)
         flash_slot = rtl838x_flash_slot(blk_by_legacy_dinfo(flash_dinfo), hdr);
         if (!machine->kernel_filename && flash_slot) {
             netgear = be32_at(hdr) == UIMAGE_MAGIC_NGE;
+            allnet = flash_slot == RTL838X_FLASH_FIRMWARE_ALLNET;
         }
     }
 
@@ -774,8 +796,9 @@ static void rtl838x_init(MachineState *machine)
     /*
      * What hangs off the GPIO lines.  The TSW2xx pulls its lines up; the
      * GS108Tv3 its reset button, and it has the RTL8231 Netgear's firmware
-     * reads its model from.  See rtl838x_gpio.c.  The GS1900 is left as it
-     * was.
+     * reads its model from.  The ALL-SG8208M has an RTL8231 too, with its
+     * reset button on pin 3, active low.  See rtl838x_gpio.c.  The GS1900
+     * is left as it was.
      */
     if (flash_slot == RTL838X_FLASH_FIRMWARE_TSW) {
         qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_TSW_PULLUPS);
@@ -784,6 +807,10 @@ static void rtl838x_init(MachineState *machine)
         qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_GS108TV3_PULLUPS);
         qdev_prop_set_bit(dev, "rtl8231", true);
         qdev_prop_set_uint64(dev, "rtl8231-straps", RTL838X_RTL8231_GS108TV3);
+    }
+    if (allnet) {
+        qdev_prop_set_bit(dev, "rtl8231", true);
+        qdev_prop_set_uint64(dev, "rtl8231-straps", RTL838X_RTL8231_ALLNET);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_GPIO_BASE);

@@ -124,10 +124,12 @@ usage: ./rtl838x.sh <command> [arguments]
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
   test-stock <image>      the same for a vendor image (Zyxel .bix, Teltonika
-                          TSW2xx, HPE 1920 .bin, Netgear GS108Tv3 .bix),
-                          booted with a scratch flash
+                          TSW2xx, HPE 1920 .bin, Netgear GS108Tv3 .bix,
+                          ALLNET ALL-SG8208M .bix), booted with a scratch
+                          flash
   mkflash <image> <flash> write a 16 MiB flash image with the firmware
-                          installed and a U-Boot environment, a 32 MiB one
+                          installed and a U-Boot environment (in ALLNET's
+                          layout for its firmware), a 32 MiB one
                           for Netgear's, or for HPE's firmware a 32 MiB one
                           with a MAC address; extra arguments go to
                           "imgtool.py mkflash"
