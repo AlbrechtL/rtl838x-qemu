@@ -118,9 +118,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RTL838xGpioState, RTL838X_GPIO)
  * What the GS108Tv3's RTL8231 pins read as inputs: high, as pulled up,
  * but for the board ID Netgear's firmware reads its model from.  Pins
  * 0..3 are bits 1, 0, 2 and 3 of it: 1 is the GS108Tv3, 3 the GS110TPv3,
- * 15 the GS110TPP.
+ * 15 the GS110TPP.  The other two firmwares read it the same way: 14 is
+ * the GS110TUP, 13 the GS710TUP; 0 is the GS308T, 2 the GS310TP.
  */
 #define RTL838X_RTL8231_GS108TV3 (0x1fffffffffull & ~0xdull)
+#define RTL838X_RTL8231_GS110TUP (0x1fffffffffull & ~0x2ull)
+#define RTL838X_RTL8231_GS308T   (0x1fffffffffull & ~0xfull)
 /*
  * The ALL-SG8208M's: all high.  ALLNET's firmware reads its reset button
  * from pin 3, and restores its factory defaults when that reads low.

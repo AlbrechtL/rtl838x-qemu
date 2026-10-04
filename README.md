@@ -9,8 +9,8 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
 Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx,
-HPE's Comware for the 1920-8G, Netgear's firmware for the GS108Tv3 and
-ALLNET's for the ALL-SG8208M all run;
+HPE's Comware for the 1920-8G, Netgear's firmware for the GS108Tv3 and the
+GS308T and ALLNET's for the ALL-SG8208M all run;
 see [Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
@@ -58,6 +58,8 @@ no kernel oops or unhandled faults       PASS
 * [Netgear firmware](#netgear-firmware)
   * [What Netgear's firmware needed](#what-netgears-firmware-needed)
   * [What Netgear's firmware lacks](#what-netgears-firmware-lacks)
+  * [The GS308T](#the-gs308t)
+  * [The GS110TUP](#the-gs110tup)
 * [ALLNET firmware](#allnet-firmware)
   * [What ALLNET's firmware needed](#what-allnets-firmware-needed)
   * [What ALLNET's firmware lacks](#what-allnets-firmware-lacks)
@@ -80,12 +82,13 @@ no kernel oops or unhandled faults       PASS
 | Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
 | HPE Comware 5.20.99 Release 1121 ([download](https://h30326.www3.hpe.com/hpn/1920-8G-JG920A_5.20.R1121.zip?merchantId=ASP_DROPBOX)) | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
 | Netgear 7.1.1.12 ([download](https://www.downloads.netgear.com/files/GDC/GS108Tv3/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip)) | Netgear GS108Tv3, GS110TPv3, GS110TPP v1; run as a GS108Tv3 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Netgear firmware](#netgear-firmware) |
+| Netgear 1.0.4.4 ([download](https://www.downloads.netgear.com/files/GDC/GS308T/GS308T_GS310TP_V1.0.4.4.zip)) | Netgear GS308T, GS310TP; run as a GS308T | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [The GS308T](#the-gs308t) |
 | ALLNET 2.2.1.2959 ([download](https://www.allnet.de/ftp-downloads/allnet/switches/all-sg8208m/all-sg8208m-version_2.2.1_vmlinux.bix.zip)) | ALLNET ALL-SG8208M | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [ALLNET firmware](#allnet-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
 firmware, which makes it a 1920-8G with a 32 MiB flash, and Netgear's, which
-makes it a GS108Tv3, with a 32 MiB flash too. Images for other RTL838x
+makes it a GS108Tv3 or a GS308T, with a 32 MiB flash too. Images for other RTL838x
 boards may work as well, as long as their device tree asks for nothing more;
 the TSW2xx's two SFP cages are there only as far as its device tree says so,
 and are empty.
@@ -793,6 +796,51 @@ before.
   SSH, SNMP, the web interface past its login page, LAGs, VLANs beyond the
   default one, and spanning tree against another switch.
 
+### The GS308T
+
+The firmware for the GS308T and the GS310TP, 1.0.4.4
+(`GS308T_GS310TP_V1.0.4.4.zip`, from
+<https://www.downloads.netgear.com/files/GDC/GS308T/GS308T_GS310TP_V1.0.4.4.zip>),
+is the same Realtek reference firmware, an older build of it, with `NGC5`
+for its magic. It boots on the same machine: `mkflash` writes it into the
+same 32 MiB layout, and the machine, seeing the magic, builds itself as a
+GS308T. The only difference to the GS108Tv3 is the board ID on the RTL8231:
+0 is the GS308T, 2 the GS310TP. The prompt is `GS308T#`.
+
+```sh
+./rtl838x.sh mkflash images/GS308T_GS310TP_V1.0.4.4.zip gs308t.bin
+./rtl838x.sh run-flash gs308t.bin \
+    -nic user,net=192.168.0.0/24,host=192.168.0.2,dhcpstart=192.168.0.239,hostfwd=tcp::8080-192.168.0.239:80
+```
+
+The account is `admin` / `password` again, but this firmware does not insist
+on a new password at the first login; `test-stock` changes it from the CLI
+instead (`username admin privilege 15 password <new>`, which asks for the
+old one) and passes the same fourteen checks. Only the GS308T is exercised:
+the GS310TP has PoE and two SFP ports. Not checked on it: the Insight agent
+and `ping` behaviour noted above for 7.1.1.12.
+
+### The GS110TUP
+
+The firmware for the GS110TUP and the GS710TUP, 1.0.5.13
+(`GS110TUPv1_GS710TUPv1_V1.0.5.13.zip`, from
+<https://www.downloads.netgear.com/files/GDC/GS710TUP/GS110TUPv1_GS710TUPv1_V1.0.5.13.zip>),
+has `NGG ` for its magic and reads board ID 14 (GS110TUP) or 13 (GS710TUP).
+The machine recognises it and builds itself as a GS110TUP, but the firmware
+does not come up: both models have PoE and an SFP port behind an external
+PHY, and the machine has neither.
+
+* The SDK's PoE driver talks to a Broadcom BCM59121 PoE controller on the
+  second UART, with Broadcom's 12-byte command frames (checksum the sum of
+  the first eleven bytes), starting with `0x20`, get system info. Unanswered,
+  `ski.ko` refuses to load, and the timer interrupt it left registered then
+  panics the kernel. Answering every frame with its own command and a valid
+  checksum, from a script on a second `-serial`, is enough to get past it.
+* The board's hardware profile puts an RTL8214C quad PHY at MAC 16, behind
+  one of the SFP ports. With nothing answering there, the SDK has no driver
+  for the port, `rsd_eee_init` gets `0xf030` (unavailable) for it, the SKI
+  core fails, and `l2g_igmp` oopses on the L3 lock it never created.
+
 ## ALLNET firmware
 
 ALLNET's ALL-SG8208M is an RTL8380M with eight copper ports, a 16 MiB flash
@@ -928,7 +976,7 @@ payload is gzip'ed or LZMA-compressed, which is unpacked to its load address
 first: that is what the [Zyxel](#zyxel-firmware), the
 [Teltonika](#teltonika-firmware), the [Netgear](#netgear-firmware) and the
 [ALLNET](#allnet-firmware) firmware are, the last two with magics of their
-own, `NGE ` and `0x00000006`.
+own, `NGE ` (`NGC5` for the GS308T's) and `0x00000006`.
 
 Because the device tree is appended to the kernel, QEMU never supplies one:
 the hardware model has to match what is already inside the image. `./rtl838x.sh dts`
@@ -947,7 +995,7 @@ time by `scripts/sync.sh`.
 | SPI-NOR controller | `0x18001200` | 16 MiB MX25L12855E on chip select 0, see [Flash](#flash), or 32 MiB for HPE's and Netgear's firmware; memory-mapped at `0x14000000` |
 | UART | `0x18002000` | 16550, reg-shift 2 |
 | Watchdog | `0x18003150` | Two phase, resets the machine so `reboot` works |
-| GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx; an RTL8231 expander on two of them on the GS108Tv3 |
+| GPIO | `0x18003500` | 24 lines; inputs pulled up on the TSW2xx; an RTL8231 expander on two of them on the Netgear boards and the ALL-SG8208M |
 | Switch core | `0x1b000000` | SoC ID, PLLs, thermal, table engine, MDIO, 8 PHYs |
 | CPU-port DMA | `0x1b009f00` | Two rings each way, 32-byte descriptors, 20-byte CPU tag |
 | Forwarding | `0x1b000000` | FDB, VLANs, spanning tree, isolation, flooding, RMA traps |
@@ -1046,11 +1094,10 @@ guest sees through the PHY is the backend's.
 * Frames are forwarded at once and in order, with no queues, no shaping and no
   rate limiting, so anything measuring bandwidth or priority measures the host.
 * The RTL8231 GPIO expander on the bit-banged MDIO bus is there only on the
-  GS108Tv3, with its pins as inputs; elsewhere it is absent, and with it the
-  reset button and the system LED.
-* The machine loads only the first image slot, at `0x260000`, `0xa0000` or
-  `0x300000`;
-  `bootpartition` in the U-Boot environment is not consulted. HPE's
+  Netgear boards and the ALL-SG8208M, with its pins as inputs; elsewhere it
+  is absent, and with it the reset button and the system LED.
+* The machine loads only the first image slot, at `0x260000`, `0xa0000`,
+  `0x300000` or `0x2a0000`; `bootpartition` in the U-Boot environment is not consulted. HPE's
   BootWare is not emulated at all.
 * There are no ACLs: the rules are stored, but nothing matches against them,
   so nothing is trapped, redirected or dropped by one.
@@ -1077,7 +1124,8 @@ tests/test_stock.py the same for the Zyxel and ALLNET firmware, from a
 tests/test_tsw.py   the same for the Teltonika firmware, which test_stock.py
                     hands it
 tests/test_hpe.py   the same for HPE's firmware, which test_stock.py hands it
-tests/test_netgear.py the same for Netgear's firmware, which test_stock.py
+tests/test_netgear.py the same for Netgear's firmware (GS108Tv3 and GS308T),
+                    which test_stock.py
                     hands it
 qemu/               submodule, pinned to v11.1.1
 ```

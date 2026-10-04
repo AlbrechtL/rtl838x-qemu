@@ -22,7 +22,9 @@ Zyxel image again with 0x00000006 for a magic.
 
 Netgear's firmware for the GS108Tv3, GS110TPv3 and GS110TPP is a uImage with
 its own magic, "NGE ", around an LZMA kernel with its root file system
-inside; Realtek's SDK again, on Linux 3.18.
+inside; Realtek's SDK again, on Linux 3.18.  The GS308T's and GS310TP's
+("NGC5") and the GS110TUP's and GS710TUP's ("NGG ") are the same, and go into
+the same flash layout.
 
 HPE's Comware for the 1920 series is no uImage at all: a table of segments,
 BootWare's two halves and the application, each behind a 0x154-byte header,
@@ -53,7 +55,10 @@ import zlib
 
 UIMAGE_MAGIC = 0x27051956
 RTL_MAGIC = 0x83800000
-NETGEAR_MAGIC = 0x4e474520     # "NGE "
+NETGEAR_MAGIC = 0x4e474520     # "NGE ", GS108Tv3, GS110TPv3, GS110TPP
+NETGEAR_MAGIC_GS110TUP = 0x4e474720  # "NGG ", GS110TUP, GS710TUP
+NETGEAR_MAGIC_GS308T = 0x4e474335    # "NGC5", GS308T, GS310TP
+NETGEAR_MAGICS = (NETGEAR_MAGIC, NETGEAR_MAGIC_GS110TUP, NETGEAR_MAGIC_GS308T)
 ALLNET_MAGIC = 0x00000006
 HDR_LEN = 64
 
@@ -176,8 +181,8 @@ class Image:
          self.dcrc) = struct.unpack(">7I", data[:28])
         self.os, self.arch, self.type, self.comp = data[28:32]
         self.name = data[32:64].rstrip(b"\0").decode("ascii", "replace")
-        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, NETGEAR_MAGIC,
-                              ALLNET_MAGIC):
+        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, ALLNET_MAGIC,
+                              *NETGEAR_MAGICS):
             raise ValueError(f"not a uImage: magic 0x{self.magic:08x}")
         # ALLNET's magic is too weak to go by alone.
         if (self.magic == ALLNET_MAGIC and
@@ -239,7 +244,7 @@ class Image:
 
     def is_netgear(self):
         """Whether this is Netgear's firmware, by its magic."""
-        return self.magic == NETGEAR_MAGIC
+        return self.magic in NETGEAR_MAGICS
 
     def is_allnet(self):
         """Whether this is ALLNET's firmware, by its magic."""
@@ -553,6 +558,8 @@ def main():
     if args.command == "info":
         vendor = {RTL_MAGIC: " (vendor magic)",
                   NETGEAR_MAGIC: " (Netgear)",
+                  NETGEAR_MAGIC_GS110TUP: " (Netgear GS110TUP)",
+                  NETGEAR_MAGIC_GS308T: " (Netgear GS308T)",
                   ALLNET_MAGIC: " (ALLNET)"}.get(img.magic, "")
         print(f"magic       0x{img.magic:08x}{vendor}")
         print(f"name        {img.name}")

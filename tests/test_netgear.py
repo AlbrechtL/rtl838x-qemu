@@ -4,7 +4,9 @@
 
 The firmware is installed into a scratch 32 MiB flash in the GS108Tv3's
 layout, the way "./rtl838x.sh mkflash" does it, and the machine, seeing
-Netgear's magic in the image slot, builds itself as a GS108Tv3.  Everything
+Netgear's magic in the image slot, builds itself as a GS108Tv3.  The
+GS308T's firmware, with a magic of its own, makes it a GS308T, and the
+GS110TUP's a GS110TUP; the checks are the same.  Everything
 after that goes through the vendor CLI on the serial console and through the
 front-panel ports.  Run it through "./rtl838x.sh test-stock <image>", which
 recognises the image and supplies the container.
@@ -26,6 +28,10 @@ import imgtool  # noqa: E402
 from test_boot import Console, Wire, arp, check, is_arp_reply  # noqa: E402
 from test_stock import free_port, http_get, send  # noqa: E402
 
+# The prompt is the model the machine is built as, by the image's magic.
+MODELS = {imgtool.NETGEAR_MAGIC: "GS108Tv3",
+          imgtool.NETGEAR_MAGIC_GS110TUP: "GS110TUP",
+          imgtool.NETGEAR_MAGIC_GS308T: "GS308T"}
 PROMPT = r"GS108Tv3# "
 # The factory account; the first login has to change its password.
 USER, PASSWORD = "admin", "password"
@@ -100,8 +106,34 @@ def main():
     return run(args)
 
 
+def send_until(con, line, pattern, tries=5, timeout=20):
+    """Type a line until the CLI answers it: what is typed while it is busy
+    printing, or before it asks, is thrown away."""
+    for _ in range(tries - 1):
+        send(con, line)
+        try:
+            return con.expect(pattern, timeout)
+        except TimeoutError:
+            pass
+    send(con, line)
+    return con.expect(pattern, timeout)
+
+
+def change_password(con):
+    """What the first login does where the firmware does not insist."""
+    send_until(con, "configure", r"\(config\)# ")
+    send_until(con, "username %s privilege 15 password %s"
+               % (USER, NEW_PASSWORD), r"Old password: ")
+    m = send_until(con, PASSWORD, r"\(config\)# |incorrect")
+    if m.group() != "(config)# ":
+        raise RuntimeError("the CLI refused the factory password")
+    send_until(con, "exit", PROMPT)
+
+
 def run(args):
+    global PROMPT
     image = imgtool.load(args.image)
+    PROMPT = r"%s# " % MODELS[image.magic]
     flash = tempfile.NamedTemporaryFile(prefix="rtl838x-flash-", suffix=".bin")
     flash.write(imgtool.mkflash_netgear(image.data,
                                         imgtool.DEFAULT_NETGEAR_BDINFO,
@@ -139,16 +171,20 @@ def run(args):
         # the firmware's, once Realtek's SDK has found its board.
         login(con, PASSWORD, args.timeout)
         print("%-40s PASS" % "reaches the vendor CLI")
-        con.expect(r"Enter new password", 60)
-        send(con, NEW_PASSWORD)
-        con.expect(r"Confirm new password", 60)
-        send(con, NEW_PASSWORD)
-        con.expect(PROMPT, 60)
+        # 7.1 makes the first login change the password; 1.0 does not.
+        if con.expect(PROMPT + r"|Enter new password", 60).group() == \
+                "Enter new password":
+            send(con, NEW_PASSWORD)
+            con.expect(r"Confirm new password", 60)
+            send(con, NEW_PASSWORD)
+            con.expect(PROMPT, 60)
+        else:
+            change_password(con)
         print("%-40s PASS" % "logs in, changing the factory password")
 
         version = cli(con, "show version")
         tests.append(check("show version names the firmware",
-                           re.search(r"Firmware Version +: 7\.\d", version)
+                           re.search(r"Firmware Version +: \d+\.\d", version)
                            is not None, version.strip()))
         tests.append(check("MAC and serial come from the flash",
                            re.search(r"MAC Address +: %s" % re.escape(MAC),

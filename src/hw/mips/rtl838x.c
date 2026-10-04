@@ -66,13 +66,16 @@
  * kernel, which the bootloader, and so this machine, inflates.  Teltonika's
  * RutOS images are a plain uImage around an LZMA kernel, with no rt-loader,
  * and get the same treatment.  Netgear's smart switches have a magic of
- * their own, "NGE " for the GS108Tv3 family, around an LZMA kernel.  ALLNET's
+ * their own, "NGE " for the GS108Tv3 family, "NGG " for the GS110TUP's and
+ * "NGC5" for the GS308T's, around an LZMA kernel.  ALLNET's
  * ALL-SG8208M, built by the same ODM as the GS1900-8, has 0x00000006 around
  * the same gzip'ed kernel.
  */
 #define UIMAGE_MAGIC        0x27051956
 #define UIMAGE_MAGIC_RTL    0x83800000
 #define UIMAGE_MAGIC_NGE    0x4e474520
+#define UIMAGE_MAGIC_NGG    0x4e474720
+#define UIMAGE_MAGIC_NGC5   0x4e474335
 #define UIMAGE_MAGIC_ALLNET 0x00000006
 #define UIMAGE_HEADER_SIZE  64
 #define UIMAGE_COMP_NONE    0
@@ -205,6 +208,31 @@ static uint32_t be32_at(const uint8_t *p)
 }
 
 /*
+ * What the RTL8231's pins read on the Netgear board a firmware is run as,
+ * by its magic; 0 if the magic is not Netgear's.  Each firmware is shared
+ * by two or three models, told apart by the board ID on the expander, and
+ * the machine is the first of them: a GS108Tv3, a GS110TUP or a GS308T.
+ */
+static uint64_t rtl838x_netgear_straps(uint32_t magic)
+{
+    switch (magic) {
+    case UIMAGE_MAGIC_NGE:
+        return RTL838X_RTL8231_GS108TV3;
+    case UIMAGE_MAGIC_NGG:
+        return RTL838X_RTL8231_GS110TUP;
+    case UIMAGE_MAGIC_NGC5:
+        return RTL838X_RTL8231_GS308T;
+    default:
+        return 0;
+    }
+}
+
+static bool rtl838x_is_netgear(uint32_t magic)
+{
+    return rtl838x_netgear_straps(magic) != 0;
+}
+
+/*
  * ALLNET's magic is too weak to go by alone, so its header has to check out
  * as well: the CRC over the header with the CRC field zeroed.
  */
@@ -214,7 +242,7 @@ static bool rtl838x_is_uimage(const uint8_t *hdr)
     uint8_t copy[UIMAGE_HEADER_SIZE];
 
     if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL ||
-        magic == UIMAGE_MAGIC_NGE) {
+        rtl838x_is_netgear(magic)) {
         return true;
     }
     if (magic != UIMAGE_MAGIC_ALLNET) {
@@ -657,7 +685,7 @@ static void rtl838x_init(MachineState *machine)
     const char *flash_model;
     size_t app_len;
     bool hpe = false;
-    bool netgear = false;
+    uint64_t netgear = 0;           /* the RTL8231's straps, for Netgear's */
     bool allnet = false;
     uint32_t flash_slot = 0;
     MACAddr mac;
@@ -681,8 +709,9 @@ static void rtl838x_init(MachineState *machine)
         }
         hpe = rtl838x_comware_app((const uint8_t *)kernel, kernel_len,
                                   &app_len) != NULL;
-        netgear = kernel_len >= UIMAGE_HEADER_SIZE &&
-                  be32_at((const uint8_t *)kernel) == UIMAGE_MAGIC_NGE;
+        if (kernel_len >= UIMAGE_HEADER_SIZE) {
+            netgear = rtl838x_netgear_straps(be32_at((const uint8_t *)kernel));
+        }
         allnet = kernel_len >= UIMAGE_HEADER_SIZE &&
                  be32_at((const uint8_t *)kernel) == UIMAGE_MAGIC_ALLNET &&
                  rtl838x_is_uimage((const uint8_t *)kernel);
@@ -699,7 +728,7 @@ static void rtl838x_init(MachineState *machine)
 
         flash_slot = rtl838x_flash_slot(blk_by_legacy_dinfo(flash_dinfo), hdr);
         if (!machine->kernel_filename && flash_slot) {
-            netgear = be32_at(hdr) == UIMAGE_MAGIC_NGE;
+            netgear = rtl838x_netgear_straps(be32_at(hdr));
             allnet = flash_slot == RTL838X_FLASH_FIRMWARE_ALLNET;
         }
     }
@@ -806,7 +835,7 @@ static void rtl838x_init(MachineState *machine)
     if (netgear) {
         qdev_prop_set_uint32(dev, "pull-ups", RTL838X_GPIO_GS108TV3_PULLUPS);
         qdev_prop_set_bit(dev, "rtl8231", true);
-        qdev_prop_set_uint64(dev, "rtl8231-straps", RTL838X_RTL8231_GS108TV3);
+        qdev_prop_set_uint64(dev, "rtl8231-straps", netgear);
     }
     if (allnet) {
         qdev_prop_set_bit(dev, "rtl8231", true);

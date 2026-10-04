@@ -124,9 +124,9 @@ usage: ./rtl838x.sh <command> [arguments]
                           out/qemu.log
   test [image]            boot an image and check it over the serial console
   test-stock <image>      the same for a vendor image (Zyxel .bix, Teltonika
-                          TSW2xx, HPE 1920 .bin, Netgear GS108Tv3 .bix,
-                          ALLNET ALL-SG8208M .bix), booted with a scratch
-                          flash
+                          TSW2xx, HPE 1920 .bin, Netgear GS108Tv3 and
+                          GS308T .bix, ALLNET ALL-SG8208M .bix), booted
+                          with a scratch flash
   mkflash <image> <flash> write a 16 MiB flash image with the firmware
                           installed and a U-Boot environment (in ALLNET's
                           layout for its firmware), a 32 MiB one
