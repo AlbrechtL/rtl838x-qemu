@@ -3,6 +3,9 @@
 Runs OpenWrt for Realtek RTL838x switch SoCs in an emulator. The target is the
 Zyxel GS1900-8 image in `images/`, booted unmodified.
 
+> **Note:** This repository was generated with the help of AI assistants. It
+> serves the author's own purpose: testing RTL838x firmwares.
+
 [OpenWrt images](https://downloads.openwrt.org/snapshots/targets/realtek/rtl838x/),
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
 Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx and
@@ -68,7 +71,7 @@ no kernel oops or unhandled faults       PASS
 | Ethernet Switch OS | an RTL8382MI board | RTL8382MI | In the emulator |
 | Zyxel V2.90(AAHH.2)C0 ([download](https://download.zyxel.com/GS1900-8/firmware/GS1900-8_2.90(AAHH.2)C0.zip)) | Zyxel GS1900-8 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Zyxel firmware](#zyxel-firmware) |
 | Teltonika RutOS TSW2_R_00.01.10.2 ([download](https://firmware.teltonika-networks.com/1.10.2/TSW2/TSW2_R_00.01.10.2_WEBUI.bin)) | Teltonika TSW2xx, run as a TSW202 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Teltonika firmware](#teltonika-firmware) |
-| HPE Comware 5.20.99 Release 1121, `1920-8G-JG920A_5.20.R1121.zip` | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
+| HPE Comware 5.20.99 Release 1121 ([download](https://h30326.www3.hpe.com/hpn/1920-8G-JG920A_5.20.R1121.zip?merchantId=ASP_DROPBOX)) | HPE 1920-8G (JG920A) | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [HPE firmware](#hpe-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
@@ -511,7 +514,9 @@ Realtek's SDK 2.1 compiled in. The 1920-8G is an RTL8380M with the eight
 copper ports, two SFP cages behind the SoC's SerDes, and a 32 MiB flash.
 
 The firmware is not in this repository. Tested is 5.20.99 Release 1121 for
-the JG920A, `1920-8G-JG920A_5.20.R1121.zip`; the zip can be used as it is.
+the JG920A, `1920-8G-JG920A_5.20.R1121.zip`, from
+<https://h30326.www3.hpe.com/hpn/1920-8G-JG920A_5.20.R1121.zip?merchantId=ASP_DROPBOX>;
+the zip can be used as it is.
 The other six 1920 models' images of the same release unpack the same way,
 but only the 1920-8G's has been booted.
 
