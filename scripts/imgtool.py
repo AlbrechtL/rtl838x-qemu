@@ -60,6 +60,7 @@ NETGEAR_MAGIC_GS110TUP = 0x4e474720  # "NGG ", GS110TUP, GS710TUP
 NETGEAR_MAGIC_GS308T = 0x4e474335    # "NGC5", GS308T, GS310TP
 NETGEAR_MAGICS = (NETGEAR_MAGIC, NETGEAR_MAGIC_GS110TUP, NETGEAR_MAGIC_GS308T)
 ALLNET_MAGIC = 0x00000006
+RTL_LOAD = 0x80000000           # the load address every rtl838x image uses
 HDR_LEN = 64
 
 COMP_GZIP = 1
@@ -78,6 +79,14 @@ FLASH_FIRMWARE2 = 0x930000  # second image slot, where the vendor layout puts it
 ALLNET_BDINFO = 0x80000
 ALLNET_SYSINFO = 0x90000
 ALLNET_FIRMWARE = 0x2a0000
+
+# The Senao boards' flash (EnGenius EGS7228P / EWS2910P, Open Mesh / Datto
+# S8): 32 MiB, two U-Boot environments low down, and the firmware in the
+# "RUNTIME" slot at 0x5a0000, behind the loader and two JFFS2 partitions.
+SENAO_FLASH_SIZE = 32 * 1024 * 1024
+SENAO_BDINFO = 0x80000
+SENAO_SYSINFO = 0x90000
+SENAO_FIRMWARE = 0x5a0000
 
 # The Teltonika TSW2xx's flash: the same chip, laid out differently.
 TSW_UBOOT_ENV = 0x80000     # "u-boot-env"
@@ -181,13 +190,23 @@ class Image:
          self.dcrc) = struct.unpack(">7I", data[:28])
         self.os, self.arch, self.type, self.comp = data[28:32]
         self.name = data[32:64].rstrip(b"\0").decode("ascii", "replace")
-        if self.magic not in (UIMAGE_MAGIC, RTL_MAGIC, ALLNET_MAGIC,
-                              *NETGEAR_MAGICS):
+        self.senao_magic = False
+        hcrc_ok = (zlib.crc32(data[:4] + bytes(4) + data[8:HDR_LEN])
+                   & 0xffffffff) == self.hcrc
+        if self.magic in (UIMAGE_MAGIC, RTL_MAGIC, *NETGEAR_MAGICS):
+            pass
+        elif self.magic == ALLNET_MAGIC:
+            # ALLNET's magic is too weak to go by alone.
+            if not hcrc_ok:
+                raise ValueError("not a uImage: magic 0x00000006, "
+                                 "bad header CRC")
+        elif hcrc_ok and self.load == RTL_LOAD and (self.os, self.arch) == (5, 5):
+            # Senao-built firmware (EnGenius, Open Mesh / Datto) stores a
+            # board id where the magic goes, but the uImage header CRC still
+            # checks out.  See mkflash_senao.
+            self.senao_magic = True
+        else:
             raise ValueError(f"not a uImage: magic 0x{self.magic:08x}")
-        # ALLNET's magic is too weak to go by alone.
-        if (self.magic == ALLNET_MAGIC and
-                zlib.crc32(data[:4] + bytes(4) + data[8:HDR_LEN]) != self.hcrc):
-            raise ValueError("not a uImage: magic 0x00000006, bad header CRC")
 
     @property
     def payload(self):
@@ -249,6 +268,15 @@ class Image:
     def is_allnet(self):
         """Whether this is ALLNET's firmware, by its magic."""
         return self.magic == ALLNET_MAGIC
+
+    def is_senao(self):
+        """Whether this is Senao-built firmware carrying a board-id magic.
+
+        The EnGenius EWS2910P and the Open Mesh / Datto S8 have board-specific
+        magics; the EnGenius EGS7228P reuses the Zyxel magic and so is not
+        told apart here -- build its flash with "mkflash --layout senao".
+        """
+        return self.senao_magic
 
     def is_tsw(self):
         """Whether this is Teltonika's firmware for the TSW2xx."""
@@ -468,6 +496,18 @@ def mkflash_netgear(data, bdinfo, sysinfo):
     return bytes(flash)
 
 
+def mkflash_senao(data, bdinfo, sysinfo):
+    """The Senao layout: two environments, the firmware in "RUNTIME"."""
+    if len(data) > SENAO_FLASH_SIZE - SENAO_FIRMWARE:
+        raise ValueError("image does not fit the flash")
+    flash = bytearray(b"\xff" * SENAO_FLASH_SIZE)
+    flash[0:len(ALLNET_LOADER_STUB)] = ALLNET_LOADER_STUB
+    flash[SENAO_BDINFO:SENAO_BDINFO + FLASH_ENV_SIZE] = uboot_env(bdinfo)
+    flash[SENAO_SYSINFO:SENAO_SYSINFO + FLASH_ENV_SIZE] = uboot_env(sysinfo)
+    flash[SENAO_FIRMWARE:SENAO_FIRMWARE + len(data)] = data
+    return bytes(flash)
+
+
 def mkflash(data, bdinfo, sysinfo, allnet=False):
     """The GS1900's layout, or with allnet the ALL-SG8208M's."""
     bdinfo_off, sysinfo_off, firmware_off = (
@@ -498,6 +538,10 @@ def main():
     ap.add_argument("--mnfinfo", action="append", default=[], metavar="NAME=VALUE",
                     help="mkflash, TSW2xx: set a manufacturing field "
                          "(mac, name, serial, batch, hwver); HPE: mac")
+    ap.add_argument("--layout", choices=["auto", "senao"], default="auto",
+                    help="mkflash: force a flash layout; 'senao' is needed "
+                         "for the EnGenius EGS7228P, whose magic the image "
+                         "shares with the Zyxel GS1900")
     args = ap.parse_args()
 
     if args.command == "unzip":
@@ -523,6 +567,11 @@ def main():
             mnfinfo.update(v.split("=", 1) for v in args.mnfinfo)
             env.setdefault("ethaddr", mnfinfo["mac"])
             flash = mkflash_tsw(img.data, env, mnfinfo)
+        elif img.is_senao() or args.layout == "senao":
+            bdinfo, sysinfo = dict(DEFAULT_BDINFO), dict(DEFAULT_SYSINFO)
+            for env, given in ((bdinfo, args.bdinfo), (sysinfo, args.sysinfo)):
+                env.update(v.split("=", 1) for v in given)
+            flash = mkflash_senao(img.data, bdinfo, sysinfo)
         else:
             bdinfo = dict(DEFAULT_NETGEAR_BDINFO if img.is_netgear()
                           else DEFAULT_BDINFO)
@@ -561,6 +610,8 @@ def main():
                   NETGEAR_MAGIC_GS110TUP: " (Netgear GS110TUP)",
                   NETGEAR_MAGIC_GS308T: " (Netgear GS308T)",
                   ALLNET_MAGIC: " (ALLNET)"}.get(img.magic, "")
+        if img.is_senao():
+            vendor = " (Senao board id, header CRC valid)"
         print(f"magic       0x{img.magic:08x}{vendor}")
         print(f"name        {img.name}")
         print(f"size        {img.size} bytes")

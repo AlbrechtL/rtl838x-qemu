@@ -38,6 +38,8 @@
 
 #define RTL838X_SW_BASE         0x1b000000
 #define RTL838X_SW_SIZE         0x00010000
+/* Unmodelled rest of the switch's 16 MiB, read as zero. */
+#define RTL838X_SW_HOLE_SIZE    (0x01000000 - RTL838X_SW_SIZE)
 
 /* Kernel entry point / uImage load address for this target. */
 #define RTL838X_KERNEL_LOAD     0x80100000
@@ -57,6 +59,7 @@
 #define RTL838X_FLASH_FIRMWARE_TSW 0x0a0000
 #define RTL838X_FLASH_FIRMWARE_NETGEAR 0x300000
 #define RTL838X_FLASH_FIRMWARE_ALLNET 0x2a0000
+#define RTL838X_FLASH_FIRMWARE_SENAO 0x5a0000   /* EnGenius, Open Mesh/Datto */
 /* The SPI controller's window onto the flash, 0xb4000000 through KSEG1. */
 #define RTL838X_FLASH_WINDOW    0x14000000
 

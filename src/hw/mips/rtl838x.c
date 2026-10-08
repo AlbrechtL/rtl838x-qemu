@@ -31,6 +31,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/char/serial-mm.h"
+#include "chardev/char.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
 #include "hw/core/irq.h"
@@ -151,9 +152,51 @@ typedef struct ResetData {
     uint64_t vector;
     uint64_t sp;
     BlockBackend *flash;    /* boot from here, when there is no -kernel */
+    const char *cmdline;    /* -append, handed over as U-Boot does */
+    hwaddr args;            /* where its argv goes */
 } ResetData;
 
 static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp);
+
+/*
+ * The kernel command line as Realtek's U-Boot passes it: a0 the argument
+ * count, a1 an argv whose first entry is empty and whose others are the
+ * words of the line, all in RAM above the boot stack.  The vendor kernels
+ * append these words to the command line built into them; that is how
+ * their bootloaders hand over board data such as Cameo's "magicid".  Without
+ * -append the registers stay zero, as before.
+ */
+#define RTL838X_ARGS_MAX    32
+
+static void rtl838x_write_args(ResetData *s, CPUMIPSState *env)
+{
+    g_auto(GStrv) words = g_strsplit_set(s->cmdline, " ", -1);
+    uint32_t argv[RTL838X_ARGS_MAX];
+    hwaddr strings = s->args + sizeof(argv);
+    unsigned argc = 1;
+
+    argv[0] = cpu_to_be32(cpu_mips_phys_to_kseg0(NULL, strings));
+    address_space_write(&address_space_memory, strings,
+                        MEMTXATTRS_UNSPECIFIED, "", 1);
+    strings++;
+    for (char **w = words; *w && argc < RTL838X_ARGS_MAX - 1; w++) {
+        size_t len = strlen(*w) + 1;
+
+        if (len == 1) {
+            continue;
+        }
+        argv[argc++] = cpu_to_be32(cpu_mips_phys_to_kseg0(NULL, strings));
+        address_space_write(&address_space_memory, strings,
+                            MEMTXATTRS_UNSPECIFIED, *w, len);
+        strings += len;
+    }
+    argv[argc] = 0;
+    address_space_write(&address_space_memory, s->args,
+                        MEMTXATTRS_UNSPECIFIED, argv,
+                        (argc + 1) * sizeof(argv[0]));
+    env->active_tc.gpr[4] = argc;
+    env->active_tc.gpr[5] = cpu_mips_phys_to_kseg0(NULL, s->args);
+}
 
 static void main_cpu_reset(void *opaque)
 {
@@ -192,6 +235,9 @@ static void main_cpu_reset(void *opaque)
     env->active_tc.gpr[5] = 0;
     env->active_tc.gpr[6] = 0;
     env->active_tc.gpr[7] = 0;
+    if (s->cmdline && *s->cmdline) {
+        rtl838x_write_args(s, env);
+    }
 
     /*
      * A stack, as a bootloader leaves one behind.  Linux sets up its own
@@ -233,8 +279,10 @@ static bool rtl838x_is_netgear(uint32_t magic)
 }
 
 /*
- * ALLNET's magic is too weak to go by alone, so its header has to check out
- * as well: the CRC over the header with the CRC field zeroed.
+ * ALLNET's magic is too weak to go by alone, and the Senao boards (EnGenius,
+ * Open Mesh / Datto) store a board id where the magic goes, so for anything
+ * but the known magics the header has to check out as well: the uImage CRC
+ * over the header with the CRC field zeroed.
  */
 static bool rtl838x_is_uimage(const uint8_t *hdr)
 {
@@ -244,9 +292,6 @@ static bool rtl838x_is_uimage(const uint8_t *hdr)
     if (magic == UIMAGE_MAGIC || magic == UIMAGE_MAGIC_RTL ||
         rtl838x_is_netgear(magic)) {
         return true;
-    }
-    if (magic != UIMAGE_MAGIC_ALLNET) {
-        return false;
     }
     memcpy(copy, hdr, sizeof(copy));
     memset(copy + 4, 0, 4);
@@ -377,6 +422,13 @@ static uint32_t rtl838x_flash_slot(BlockBackend *blk,
     static const uint32_t slots[] = {
         RTL838X_FLASH_FIRMWARE, RTL838X_FLASH_FIRMWARE_TSW,
         RTL838X_FLASH_FIRMWARE_NETGEAR, RTL838X_FLASH_FIRMWARE_ALLNET,
+        /*
+         * Last: a Senao image carries a board id, not a dedicated magic, so
+         * it is recognised only by its slot and a valid header CRC.  The
+         * other slots are empty in a Senao flash, so this never pre-empts a
+         * board that keeps its firmware lower down.
+         */
+        RTL838X_FLASH_FIRMWARE_SENAO,
     };
 
     for (unsigned i = 0; i < ARRAY_SIZE(slots); i++) {
@@ -409,11 +461,11 @@ static uint64_t rtl838x_load_flash(BlockBackend *blk, Error **errp)
 
     slot = rtl838x_flash_slot(blk, hdr);
     if (!slot) {
-        error_setg(errp, "no uImage in flash at 0x%x, 0x%x, 0x%x or 0x%x: "
-                   "nothing to boot; install a firmware first, or boot one "
-                   "with -kernel", RTL838X_FLASH_FIRMWARE,
+        error_setg(errp, "no uImage in flash at 0x%x, 0x%x, 0x%x, 0x%x or "
+                   "0x%x: nothing to boot; install a firmware first, or boot "
+                   "one with -kernel", RTL838X_FLASH_FIRMWARE,
                    RTL838X_FLASH_FIRMWARE_TSW, RTL838X_FLASH_FIRMWARE_NETGEAR,
-                   RTL838X_FLASH_FIRMWARE_ALLNET);
+                   RTL838X_FLASH_FIRMWARE_ALLNET, RTL838X_FLASH_FIRMWARE_SENAO);
         return 0;
     }
     size = rtl838x_check_uimage(hdr, blk_getlength(blk) - slot, "flash",
@@ -687,11 +739,13 @@ static void rtl838x_init(MachineState *machine)
     bool hpe = false;
     uint64_t netgear = 0;           /* the RTL8231's straps, for Netgear's */
     bool allnet = false;
+    bool senao = false;             /* an EnGenius / Open Mesh board */
     uint32_t flash_slot = 0;
     MACAddr mac;
     MIPSCPU *cpu;
     CPUMIPSState *env;
     Clock *cpuclk;
+    Chardev *uart1;
 
     /*
      * The kernel image first: HPE's Comware is what makes this an HPE
@@ -720,7 +774,8 @@ static void rtl838x_init(MachineState *machine)
     /*
      * Then the flash: which slot holds a firmware says which board this is
      * when there is no kernel.  The firmware where the TSW2xx keeps it makes
-     * a TSW2xx; Netgear's makes a GS108Tv3, and ALLNET's an ALL-SG8208M.
+     * a TSW2xx; Netgear's makes a GS108Tv3, ALLNET's an ALL-SG8208M, and the
+     * "RUNTIME" slot a Senao board (EnGenius, Open Mesh / Datto).
      */
     flash_dinfo = drive_get(IF_MTD, 0, 0);
     if (flash_dinfo) {
@@ -730,6 +785,7 @@ static void rtl838x_init(MachineState *machine)
         if (!machine->kernel_filename && flash_slot) {
             netgear = rtl838x_netgear_straps(be32_at(hdr));
             allnet = flash_slot == RTL838X_FLASH_FIRMWARE_ALLNET;
+            senao = flash_slot == RTL838X_FLASH_FIRMWARE_SENAO;
         }
     }
 
@@ -744,6 +800,8 @@ static void rtl838x_init(MachineState *machine)
     reset_info->vector = env->active_tc.PC;
     reset_info->sp = cpu_mips_phys_to_kseg0(NULL, machine->ram_size -
                                             RTL838X_BOOT_STACK_GAP);
+    reset_info->cmdline = machine->kernel_cmdline;
+    reset_info->args = machine->ram_size - RTL838X_BOOT_STACK_GAP;
     qemu_register_reset(main_cpu_reset, reset_info);
 
     memory_region_add_subregion(sysmem, RTL838X_RAM_BASE, machine->ram);
@@ -786,7 +844,8 @@ static void rtl838x_init(MachineState *machine)
      * backed by "-drive if=mtd" when there is one.
      */
     flash_model = rms->flash_model ? rms->flash_model
-                : hpe || netgear ? RTL838X_FLASH_TYPE_32M : RTL838X_FLASH_TYPE;
+                : hpe || netgear || senao ? RTL838X_FLASH_TYPE_32M
+                : RTL838X_FLASH_TYPE;
     if (!object_class_by_name(flash_model)) {
         error_report("flash-model '%s' is not a flash chip QEMU models",
                      flash_model);
@@ -841,6 +900,15 @@ static void rtl838x_init(MachineState *machine)
         qdev_prop_set_bit(dev, "rtl8231", true);
         qdev_prop_set_uint64(dev, "rtl8231-straps", RTL838X_RTL8231_ALLNET);
     }
+    if (senao) {
+        /*
+         * Senao's board.ko drives an RTL8231 to set up the LEDs; without it
+         * the board-vendor module never finishes.  The board id it reads
+         * from the expander does not matter to the firmware here, so the
+         * straps are left at zero.
+         */
+        qdev_prop_set_bit(dev, "rtl8231", true);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_GPIO_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -873,11 +941,19 @@ static void rtl838x_init(MachineState *machine)
     if (hpe) {
         qdev_prop_set_uint32(dev, "int-mode-ctrl", HPE_INT_MODE_CTRL);
     }
-    if (hpe || netgear) {
+    if (hpe || netgear || senao) {
         qdev_prop_set_bit(dev, "flash-4byte", true);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RTL838X_SW_BASE);
+    /*
+     * Older Realtek SDKs probe for an RTL8328 first, reading its chip ID at
+     * 0xbb06fff8, past the end of this chip's switch window.  The hardware
+     * answers with something that is not 0x8328 rather than a bus error.
+     */
+    create_unimplemented_device("rtl838x.switch-hole",
+                                RTL838X_SW_BASE + RTL838X_SW_SIZE,
+                                RTL838X_SW_HOLE_SIZE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(intc, RTL838X_IRQ_SWITCH));
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
@@ -913,11 +989,20 @@ static void rtl838x_init(MachineState *machine)
     serial_mm_init(sysmem, RTL838X_UART0_BASE, 2,
                    qdev_get_gpio_in(intc, RTL838X_IRQ_UART0),
                    RTL838X_LXB_HZ / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
-    if (serial_hd(1)) {
+    /*
+     * The second UART is the one a Senao board's PoE controller hangs off;
+     * its firmware polls the line-status register, which never settles with
+     * no UART mapped there, so the board gets one even without a second
+     * -serial: a null backend when the command line names none.
+     */
+    uart1 = serial_hd(1);
+    if (!uart1 && senao) {
+        uart1 = qemu_chr_new("rtl838x.uart1", "null", NULL);
+    }
+    if (uart1) {
         serial_mm_init(sysmem, RTL838X_UART1_BASE, 2,
                        qdev_get_gpio_in(intc, RTL838X_IRQ_UART1),
-                       RTL838X_LXB_HZ / 16, serial_hd(1),
-                       DEVICE_LITTLE_ENDIAN);
+                       RTL838X_LXB_HZ / 16, uart1, DEVICE_LITTLE_ENDIAN);
     }
 
     if (machine->kernel_filename) {
