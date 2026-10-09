@@ -10,7 +10,8 @@ Zyxel GS1900-8 image in `images/`, booted unmodified.
 [Ethernet Switch OS images](https://albrechtl.github.io/ethernet-switch-os/),
 Zyxel's own firmware for the GS1900-8, Teltonika's RutOS for the TSW2xx,
 HPE's Comware for the 1920-8G, Netgear's firmware for the GS108Tv3 and the
-GS308T and ALLNET's for the ALL-SG8208M all run;
+GS308T, ALLNET's for the ALL-SG8208M and EnGenius's for the EGS7228P and
+EWS2910P all run;
 see [Tested firmware](#tested-firmware) for exactly which.
 
 Current state: the machine boots the stock firmware to an OpenWrt shell, DSA
@@ -63,6 +64,9 @@ no kernel oops or unhandled faults       PASS
 * [ALLNET firmware](#allnet-firmware)
   * [What ALLNET's firmware needed](#what-allnets-firmware-needed)
   * [What ALLNET's firmware lacks](#what-allnets-firmware-lacks)
+* [EnGenius firmware](#engenius-firmware)
+  * [What the Senao boards needed](#what-the-senao-boards-needed)
+  * [Other Senao-built firmware](#other-senao-built-firmware)
 * [How the image boots](#how-the-image-boots)
 * [What is modelled](#what-is-modelled)
 * [How the data path works](#how-the-data-path-works)
@@ -84,12 +88,16 @@ no kernel oops or unhandled faults       PASS
 | Netgear 7.1.1.12 ([download](https://www.downloads.netgear.com/files/GDC/GS108Tv3/GS108Tv3_GS110TPv3_GS110TPPv1_V7.1.1.12.zip)) | Netgear GS108Tv3, GS110TPv3, GS110TPP v1; run as a GS108Tv3 | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [Netgear firmware](#netgear-firmware) |
 | Netgear 1.0.4.4 ([download](https://www.downloads.netgear.com/files/GDC/GS308T/GS308T_GS310TP_V1.0.4.4.zip)) | Netgear GS308T, GS310TP; run as a GS308T | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [The GS308T](#the-gs308t) |
 | ALLNET 2.2.1.2959 ([download](https://www.allnet.de/ftp-downloads/allnet/switches/all-sg8208m/all-sg8208m-version_2.2.1_vmlinux.bix.zip)) | ALLNET ALL-SG8208M | RTL8380M | In the emulator, by `./rtl838x.sh test-stock`; see [ALLNET firmware](#allnet-firmware) |
+| EnGenius EGS7228P 1.00.08 ([download](https://www.engeniustech.com/wp_firmware/EGS7228P%20FWv1.00.08.zip)) | EnGenius EGS7228P | RTL8382M | In the emulator, to its CLI; see [EnGenius firmware](#engenius-firmware) |
+| EnGenius EWS2910P 1.07.34 ([download](https://www.engeniustech.com/wp_firmware/EWS2910P.zip)) | EnGenius EWS2910P | RTL8380M | In the emulator, to its CLI; see [EnGenius firmware](#engenius-firmware) |
 
 Whatever an image was built for, the machine identifies itself as an RTL8380M
 and has the GS1900-8's eight ports and 16 MiB flash, except for HPE's
-firmware, which makes it a 1920-8G with a 32 MiB flash, and Netgear's, which
-makes it a GS108Tv3 or a GS308T, with a 32 MiB flash too. Images for other RTL838x
-boards may work as well, as long as their device tree asks for nothing more;
+firmware, which makes it a 1920-8G with a 32 MiB flash, Netgear's, which
+makes it a GS108Tv3 or a GS308T, with a 32 MiB flash too, and EnGenius's,
+which makes it a Senao board with a 32 MiB flash and an RTL8231 expander.
+Images for other RTL838x boards may work as well, as long as their device
+tree asks for nothing more;
 the TSW2xx's two SFP cages are there only as far as its device tree says so,
 and are empty.
 
@@ -956,6 +964,103 @@ switch's own address, and port counters read zero. Untested: firmware upgrade,
 the second image slot, `reboot` from the CLI, SSH, SNMP, the web interface
 past its front page, LAGs, VLANs beyond the default one, and spanning tree
 against another switch.
+
+## EnGenius firmware
+
+EnGenius's EGS7228P and EWS2910P come from the Senao/Cameo ODM, the same one
+behind the Zyxel GS1900. Their firmware is a uImage with the usual load
+address and a valid header CRC, but the magic field holds a board id rather
+than a vendor magic -- the EGS7228P even reuses the GS1900's `0x83800000` --
+and it lives in a 32 MiB flash with its firmware ("RUNTIME") at `0x5a0000`.
+
+The firmware is not in this repository. Tested are 1.00.08
+(`EGS7228P FWv1.00.08.zip`, from
+<https://www.engeniustech.com/wp_firmware/EGS7228P%20FWv1.00.08.zip>) and
+1.07.34 (`EWS2910P.zip`, from
+<https://www.engeniustech.com/wp_firmware/EWS2910P.zip>); the zips can be
+used as they are, the tools take the `.bix` out of them. The EGS7228P's magic
+collides with the GS1900's, so `mkflash` needs telling which layout to write;
+the EWS2910P's board id is unique enough to auto-detect:
+
+```sh
+./rtl838x.sh mkflash 'images/EGS7228P FWv1.00.08.zip' egs7228p.bin --layout senao
+./rtl838x.sh run-flash egs7228p.bin -m 256
+
+./rtl838x.sh mkflash images/EWS2910P.zip ews2910p.bin
+./rtl838x.sh run-flash ews2910p.bin -m 256
+```
+
+Both need `-m 256`, the kernel's built-in `mem=256M`. The console logs
+`Detect fan failed.` and, on first boot, the usual factory-default
+generation; the PoE controller, a Broadcom chip on the second UART, is not
+modelled, so `POE init not success` is printed and PoE stays inert. Past
+that, both reach their CLI:
+
+```
+Press any key to continue
+Username: admin
+Password: ********
+EGS7228P# show version
+...
+```
+
+The account is `admin` / `password`; the prompt is `EGS7228P#` or
+`EWS2910P#`, and `show version` reports the EnGenius model. There is no
+`test-stock` profile for either yet, so this was a manual console login, not
+the ports/switching/web checks the other vendors get.
+
+### What the Senao boards needed
+
+* **Any CRC-valid uImage, not just a known magic.** `imgtool.py` now accepts
+  one with load address `0x80000000` and the usual os/arch fields whatever
+  its magic field holds, taking it for a board id (`is_senao`); `mkflash
+  --layout {auto,senao}` picks the 32 MiB Senao layout (`mkflash_senao`:
+  environments at `0x80000`/`0x90000`, firmware at `0x5a0000`, an
+  ALLNET-style U-Boot loader stub), forced for the EGS7228P and
+  auto-detected for the others.
+* **The `0x5a0000` firmware slot**, added last to the machine's search order
+  so it never pre-empts a board that keeps its firmware lower down.
+* **The RTL8231 expander**, as on the Netgear boards and the ALL-SG8208M --
+  the board module sets up its LEDs through it.
+* **A second UART, always present.** It is the PoE MCU's port; the firmware
+  polls its line status register even with nothing attached, so the machine
+  gives a Senao board one with a null backend when there is no second
+  `-serial`.
+* **A read-as-zero hole above the switch's register window**, at
+  `0x1b010000` and up, so older SDKs' RTL8328 probe at `0xbb06fff8` reads
+  "not an 8328" instead of bus-erroring.
+* **A U-Boot-style `-append` handoff** (`a0`/`a1` as the argument count and
+  vector), which [other Senao-built firmware](#other-senao-built-firmware)
+  needs to be told its model with `magicid=` on the kernel command line; the
+  two EnGenius images do not use it.
+
+None of it changed what OpenWrt, the Zyxel, the Teltonika, the HPE, the
+Netgear or the ALLNET firmware see: all pass their tests as before.
+
+### Other Senao-built firmware
+
+Three further images from the same ODM get further than before but do not
+reach a usable CLI, and are not in [Tested firmware](#tested-firmware):
+
+* **Open Mesh / Datto S8-L** (01.03.24) boots all the way to its `Username:`
+  prompt, but ships a default configuration whose admin password is a
+  CloudTrax/Datto-set MD5 with no documented standalone default; `admin` /
+  `admin` and `admin` / `password` both answer `% Authentication Failed`. The
+  other Open Mesh models (`oms8`, `oms24`, `s24-l`, `s24v3`) share this
+  firmware line and have not been tried.
+* **TRENDnet TEG-082WS v2** (2.10.024) is Cameo's "single firmware", shared
+  across TRENDnet, EnGenius ECS, SOARnex and Apresia and told its model by
+  `magicid=` on the kernel command line. It needs a 32 MiB flash in its own
+  layout (`KERNEL1` at `0x100000`, squashfs `ROOTFS1` at `0x280000`, `JFFS2`
+  at `0x1e00000`, built by hand) and `-append "... magicid=0"`; with that it
+  mounts its root and prints its model name, then stops in the platform
+  init's `<PF2>` task, which drives the two SFP/fibre ports the machine does
+  not model.
+* **Ubiquiti USW-Lite-8-PoE** (7.5.15) is a UBNT container around a uImage;
+  given to `-kernel` it reaches the Realtek SDK, which then fails
+  (`rtl838x_scan_eeprom` and `system_init failed`, then an oops in
+  `rtcore`) for want of the board data its SDK expects from an EEPROM
+  partition at `0xff0000`, which has not been synthesised.
 
 ## How the image boots
 
